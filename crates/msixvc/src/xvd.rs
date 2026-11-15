@@ -314,6 +314,22 @@ pub struct SegmentFile {
     pub keep_encrypted: bool,
 }
 
+impl SegmentFile {
+    /// Ciphertext is retained as complete XTS data units, including the final
+    /// page beyond the logical file length. Plain files have no such padding.
+    pub fn stored_length(&self) -> io::Result<u64> {
+        if !self.keep_encrypted {
+            return Ok(self.length);
+        }
+        self.length
+            .div_ceil(PAGE_SIZE as u64)
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "encrypted file length overflows")
+            })
+    }
+}
+
 fn decode_utf16(bytes: &[u16], what: &str) -> io::Result<String> {
     String::from_utf16(bytes).map_err(|err| {
         io::Error::new(
@@ -326,6 +342,16 @@ fn decode_utf16(bytes: &[u16], what: &str) -> io::Result<String> {
 impl XvdFile {
     pub fn content_id(&self) -> uuid::Uuid {
         self.header.vduid
+    }
+
+    pub fn resume_identity(&self) -> String {
+        let mut identity = self.header.signature.to_vec();
+        identity.extend(self.header.top_hash_block_hash);
+        identity.extend(self.header.original_xvc_data_hash);
+        identity.extend(self.header.user_data_hash);
+        identity.extend(self.header.vduid.as_bytes());
+        identity.extend(self.header.pduid.as_bytes());
+        crate::streaming::resume_digest(&identity)
     }
 
     fn non_encrypted_prefix_len(&self, start: u64, len: u64) -> u64 {
@@ -851,7 +877,8 @@ impl XvdFile {
         })
     }
 
-    pub async fn download_file_http<Writer, Progress>(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn download_file_http<Writer, Progress, Checkpoint>(
         &self,
         client: &reqwest::Client,
         url: &str,
@@ -859,10 +886,13 @@ impl XvdFile {
         sfile: &SegmentFile,
         full_key: [u8; 32],
         mut progress: Progress,
+        resume_offset: u64,
+        mut checkpoint: Checkpoint,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         Writer: AsyncWrite + Unpin,
         Progress: FnMut(u64, u64),
+        Checkpoint: FnMut(u64) -> std::io::Result<()>,
     {
         if sfile.length == 0 {
             return Ok(());
@@ -898,16 +928,23 @@ impl XvdFile {
         let page_start = file_offset_in_section / PAGE_SIZE as u64;
         let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
 
+        if resume_offset > sfile.length || !resume_offset.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(
+                io::Error::new(ErrorKind::InvalidInput, "invalid download resume offset").into(),
+            );
+        }
+
         let mut page = [0u8; PAGE_SIZE];
-        let mut remaining = sfile.length;
-        let mut page_in_section = page_start;
+        let mut remaining = sfile.length - resume_offset;
+        let mut page_in_section = page_start + resume_offset / PAGE_SIZE as u64;
         let page_length = sfile
             .length
             .div_ceil(PAGE_SIZE as u64)
             .saturating_mul(PAGE_SIZE as u64);
         let mut stream = None;
         let mut pending = bytes::BytesMut::new();
-        let mut v: u64 = 0;
+        let mut v: u64 = resume_offset;
+        let mut last_checkpoint = resume_offset;
 
         let stall_timeout = tokio::time::Duration::from_secs(5);
         let mut reconnect_attempts = 0usize;
@@ -944,6 +981,8 @@ impl XvdFile {
                 Ok(Some(Ok(data))) if !data.is_empty() => data,
                 _ => {
                     if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                        out.flush().await?;
+                        checkpoint(sfile.length - remaining)?;
                         return Err(io::Error::other(format!(
                             "download interrupted for segment at offset {} (length {}): {} reconnect attempts failed ({} of {} bytes received)",
                             sfile.offset,
@@ -1043,13 +1082,24 @@ impl XvdFile {
 
                 page_in_section += 1;
             }
+
+            let written = sfile.length - remaining;
+            if written.saturating_sub(last_checkpoint) >= 32 * 1024 * 1024 {
+                out.flush().await?;
+                checkpoint(written)?;
+                last_checkpoint = written;
+            }
         }
         if remaining > 0 {
+            out.flush().await?;
+            checkpoint(sfile.length - remaining)?;
             return Err(Box::new(std::io::Error::other(format!(
                 "{} of {} missing have {}",
                 remaining, sfile.length, v
             ))));
         }
+        out.flush().await?;
+        checkpoint(sfile.length)?;
         Ok(())
     }
 
@@ -1291,6 +1341,8 @@ mod tests {
                 &test_segment(),
                 [0u8; 32],
                 |_, _| {},
+                0,
+                |_| Ok(()),
             )
             .await?;
         Ok(out)

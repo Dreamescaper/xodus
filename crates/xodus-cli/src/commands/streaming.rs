@@ -17,6 +17,9 @@ use xodus::tokens::TokenManager;
 use crate::license::get_license;
 use crate::package::{get_content_id, get_packages};
 
+#[path = "streaming_resume.rs"]
+mod resume;
+
 struct Job {
     name: String,
     content: SegmentFile,
@@ -296,6 +299,14 @@ where
         return ExitCode::FAILURE;
     }
 
+    let _folder_lock = match resume::lock(out) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("cannot start this download: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
 
@@ -453,7 +464,22 @@ where
         }
     };
 
-    let total_size = rfiles
+    let identity = match resume::Journal::identity(&remote_xvd.resume_identity(), &rfiles) {
+        Ok(identity) => identity,
+        Err(err) => {
+            eprintln!("could not prepare download checkpoints: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let journal = match resume::Journal::open_with_identity(out, &identity) {
+        Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
+        Err(err) => {
+            eprintln!("could not open download checkpoints: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let jobs: Vec<Job> = rfiles
         .iter()
         .filter(|(k, v1)| {
             if let Some(v2) = lfiles.get(*k) {
@@ -462,10 +488,29 @@ where
                 true
             }
         })
-        .map(|(_, v)| v.length)
+        .map(|(n, v)| Job {
+            name: n.clone(),
+            content: SegmentFile {
+                offset: v.offset,
+                length: v.length,
+                data_hashs: vec![],
+                keep_encrypted: v.keep_encrypted,
+            },
+        })
+        .collect();
+
+    let total_size: u64 = jobs.iter().map(|job| job.content.length).sum();
+    let saved: u64 = jobs
+        .iter()
+        .map(|job| {
+            journal
+                .lock()
+                .expect("journal lock poisoned")
+                .offset(&job.name, job.content.length)
+        })
         .sum();
 
-    let required_free_space = total_size;
+    let required_free_space = total_size.saturating_sub(saved);
     let available_free_space = match available_space(out) {
         Ok(space) => space,
         Err(err) => {
@@ -498,25 +543,6 @@ where
 
     let remote_xvd_ref = &remote_xvd;
     let full_key = *full_key;
-    let jobs: Vec<Job> = rfiles
-        .iter()
-        .filter(|(k, v1)| {
-            if let Some(v2) = lfiles.get(*k) {
-                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-            } else {
-                true
-            }
-        })
-        .map(|(n, v)| Job {
-            name: n.clone(),
-            content: SegmentFile {
-                offset: v.offset,
-                length: v.length,
-                data_hashs: vec![],
-                keep_encrypted: v.keep_encrypted,
-            },
-        })
-        .collect();
 
     if !jobs.is_empty()
         && let Err(err) = std::fs::remove_file(&final_path)
@@ -535,8 +561,20 @@ where
         .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
             let tx = tx.clone();
             let client = client.clone();
+            let journal = journal.clone();
             async move {
-                download_segment(remote_xvd_ref, &client, url, out, &job, id, &tx, full_key).await
+                download_segment(
+                    remote_xvd_ref,
+                    &client,
+                    url,
+                    out,
+                    &job,
+                    id,
+                    &tx,
+                    full_key,
+                    &journal,
+                )
+                .await
             }
         })
         .await;
@@ -568,8 +606,10 @@ async fn download_segment(
     id: usize,
     tx: &Sender<ProgressEvent>,
     full_key: [u8; 32],
+    journal: &std::sync::Mutex<resume::Journal>,
 ) -> Result<(), String> {
-    let target_file = out.join(job.name.replace("\\", "/"));
+    let target_file = resume::target(out, &job.name)
+        .map_err(|err| format!("invalid segment path {}: {err}", job.name))?;
     if let Some(folder) = target_file.parent()
         && let Err(err) = std::fs::create_dir_all(folder)
     {
@@ -582,7 +622,7 @@ async fn download_segment(
     let mut fout = match OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(false)
         .open(&target_file)
         .await
     {
@@ -595,7 +635,25 @@ async fn download_segment(
             ));
         }
     };
-    let mut lp = 0;
+
+    let mut offset = journal
+        .lock()
+        .expect("journal lock poisoned")
+        .offset(&job.name, job.content.length);
+    if url.starts_with("file://") {
+        offset = 0;
+    }
+    let offset = match resume::prepare_output(&mut fout, offset, &job.content).await {
+        Ok(offset) => offset,
+        Err(err) => {
+            return Err(format!(
+                "could not prepare {} for segment {}: {err}",
+                target_file.display(),
+                job.name
+            ));
+        }
+    };
+    let mut lp = offset;
 
     let progress = |pos, _| {
         if tx
@@ -616,6 +674,20 @@ async fn download_segment(
     })
     .await
     .ok();
+    tx.send(ProgressEvent::Advanced { id, delta: offset })
+        .await
+        .ok();
+
+    if offset == job.content.length {
+        tx.send(ProgressEvent::Finished { id }).await.ok();
+        return Ok(());
+    }
+
+    journal
+        .lock()
+        .expect("journal lock poisoned")
+        .checkpoint(&job.name, offset)
+        .map_err(|err| format!("could not checkpoint segment {}: {err}", job.name))?;
 
     if let Some(fpath) = url.strip_prefix("file://") {
         let mut i = match File::open(fpath).await {
@@ -633,7 +705,21 @@ async fn download_segment(
             .map_err(|err| format!("could not extract segment {} from {fpath}: {err}", job.name))?;
     } else {
         remote_xvd
-            .download_file_http(client, url, &mut fout, &job.content, full_key, progress)
+            .download_file_http(
+                client,
+                url,
+                &mut fout,
+                &job.content,
+                full_key,
+                progress,
+                offset,
+                |position| {
+                    journal
+                        .lock()
+                        .expect("journal lock poisoned")
+                        .checkpoint(&job.name, position)
+                },
+            )
             .await
             .map_err(|err| {
                 format!(
