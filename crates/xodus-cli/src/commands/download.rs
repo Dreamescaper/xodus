@@ -14,7 +14,96 @@ use tokio::io::AsyncWriteExt;
 use xodus::models::packagespc::PackageFile;
 use xodus::tokens::TokenManager;
 
-use crate::package::{get_content_id, get_packages};
+use crate::package::{SelectionOptions, get_content_id, get_packages};
+
+/// Everything `download` needs from the command line.
+#[derive(Debug, Clone, Default)]
+pub struct DownloadOptions {
+    pub market: Option<String>,
+    pub dry_run: bool,
+    pub selection: SelectionOptions,
+    pub all_files: bool,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FileSelection {
+    Selected(Vec<usize>),
+    Prompt,
+}
+
+/// One package file offered to the user, with the size shown in launcher-facing errors when the
+/// server supplied a non-negative value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChoice {
+    pub name: String,
+    pub size: Option<u64>,
+}
+
+fn format_file_choices(files: &[FileChoice]) -> String {
+    if files.is_empty() {
+        return "  (none)".to_owned();
+    }
+    files
+        .iter()
+        .map(|file| match file.size {
+            Some(size) => format!("  {}\t{}", file.name, size),
+            None => format!("  {}", file.name),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Decide which package files to download without touching the terminal.
+///
+/// `interactive` says whether a prompt is allowed at all; the caller computes it from the global
+/// non-interactive switch plus terminal detection.
+pub fn choose_files(
+    files: &[FileChoice],
+    all_files: bool,
+    requested: &[String],
+    interactive: bool,
+) -> Result<FileSelection, String> {
+    if all_files {
+        if files.is_empty() {
+            return Err("error: the package contains no files to download".to_owned());
+        }
+        return Ok(FileSelection::Selected((0..files.len()).collect()));
+    }
+
+    if !requested.is_empty() {
+        let mut selected = Vec::new();
+        let mut missing = Vec::new();
+        for name in requested {
+            match files.iter().position(|file| &file.name == name) {
+                Some(index) => {
+                    if !selected.contains(&index) {
+                        selected.push(index);
+                    }
+                }
+                None => missing.push(name.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            let noun = if missing.len() == 1 { "file" } else { "files" };
+            return Err(format!(
+                "error: unknown package {noun} {}; valid values:\n{}",
+                missing.join(", "),
+                format_file_choices(files)
+            ));
+        }
+        return Ok(FileSelection::Selected(selected));
+    }
+
+    if interactive {
+        return Ok(FileSelection::Prompt);
+    }
+
+    Err(format!(
+        "error: file selection required; pass --all-files or --file <name>\n{}",
+        format_file_choices(files)
+    ))
+}
 
 #[derive(Debug)]
 enum DownloadError {
@@ -391,10 +480,17 @@ pub async fn run(
     client: &reqwest::Client,
     tokens: &TokenManager,
     product: String,
-    market: Option<String>,
-    dry_run: bool,
+    options: DownloadOptions,
 ) -> ExitCode {
-    let content_id_task = get_content_id(client, product, market).await;
+    let DownloadOptions {
+        market,
+        dry_run,
+        selection,
+        all_files,
+        files: requested_files,
+    } = options;
+
+    let content_id_task = get_content_id(client, product, market, &selection).await;
     let Ok(content_id) = content_id_task else {
         let Err(err) = content_id_task else {
             eprintln!("Unknown Error");
@@ -414,21 +510,51 @@ pub async fn run(
         return ExitCode::FAILURE;
     };
 
-    let Ok(files) = MultiSelect::new("Select files to download", package.package_files)
-        .with_page_size(30)
-        .with_validator(|input: &[inquire::list_option::ListOption<&PackageFile>]| {
-            if !input.is_empty() {
-                Ok(Validation::Valid)
-            } else {
-                Ok(Validation::Invalid(
-                    "At least one item has to be selected".into(),
-                ))
-            }
+    let package_files = package.package_files;
+    let file_choices: Vec<FileChoice> = package_files
+        .iter()
+        .map(|file| FileChoice {
+            name: file.file_name.clone(),
+            size: u64::try_from(file.file_size).ok(),
         })
-        .prompt()
-    else {
-        tracing::error!("Selection failed");
-        return ExitCode::FAILURE;
+        .collect();
+    let file_selection = match choose_files(
+        &file_choices,
+        all_files,
+        &requested_files,
+        selection.prompt_allowed(),
+    ) {
+        Ok(selection) => selection,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let files = match file_selection {
+        FileSelection::Selected(indices) => indices
+            .into_iter()
+            .map(|index| package_files[index].clone())
+            .collect(),
+        FileSelection::Prompt => {
+            let Ok(files) = MultiSelect::new("Select files to download", package_files)
+                .with_page_size(30)
+                .with_validator(|input: &[inquire::list_option::ListOption<&PackageFile>]| {
+                    if !input.is_empty() {
+                        Ok(Validation::Valid)
+                    } else {
+                        Ok(Validation::Invalid(
+                            "At least one item has to be selected".into(),
+                        ))
+                    }
+                })
+                .prompt()
+            else {
+                tracing::error!("Selection failed");
+                return ExitCode::FAILURE;
+            };
+            files
+        }
     };
     println!();
     for file in files {
@@ -483,7 +609,10 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
 
-    use super::{download_file, download_from_any, url_authority, validate_file_name};
+    use super::{
+        FileChoice, FileSelection, choose_files, download_file, download_from_any, url_authority,
+        validate_file_name,
+    };
 
     #[derive(Debug, Default)]
     struct RequestInfo {
@@ -1066,5 +1195,71 @@ mod tests {
                 "{name:?} should have been rejected"
             );
         }
+    }
+
+    fn files() -> Vec<FileChoice> {
+        vec![
+            FileChoice {
+                name: "a.msixvc".to_owned(),
+                size: Some(123),
+            },
+            FileChoice {
+                name: "b.xsp".to_owned(),
+                size: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn all_files_selects_every_file_without_a_prompt() {
+        assert_eq!(
+            choose_files(&files(), true, &[], false),
+            Ok(FileSelection::Selected(vec![0, 1]))
+        );
+    }
+
+    #[test]
+    fn listed_files_select_the_matching_indices() {
+        assert_eq!(
+            choose_files(
+                &files(),
+                false,
+                &[
+                    "b.xsp".to_owned(),
+                    "a.msixvc".to_owned(),
+                    "b.xsp".to_owned()
+                ],
+                false,
+            ),
+            Ok(FileSelection::Selected(vec![1, 0]))
+        );
+    }
+
+    #[test]
+    fn an_unknown_file_lists_choices_in_a_stable_layout() {
+        let error = choose_files(&files(), false, &["missing.xsp".to_owned()], false).unwrap_err();
+        assert_eq!(
+            error,
+            "error: unknown package file missing.xsp; valid values:\n  a.msixvc\t123\n  b.xsp"
+        );
+    }
+
+    #[test]
+    fn several_files_prompt_only_when_interactive() {
+        assert_eq!(
+            choose_files(&files(), false, &[], true),
+            Ok(FileSelection::Prompt)
+        );
+
+        let error = choose_files(&files(), false, &[], false).unwrap_err();
+        assert_eq!(
+            error,
+            "error: file selection required; pass --all-files or --file <name>\n  a.msixvc\t123\n  b.xsp"
+        );
+    }
+
+    #[test]
+    fn all_files_with_an_empty_package_is_an_error() {
+        assert!(choose_files(&[], true, &[], false).is_err());
     }
 }
