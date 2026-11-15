@@ -118,7 +118,11 @@ impl<'t> HttpRead<'t> {
             return 0;
         };
 
-        let available = &chunk[self.pending_chunk_offset..];
+        let Some(available) = chunk.get(self.pending_chunk_offset..) else {
+            self.pending_chunk = None;
+            self.pending_chunk_offset = 0;
+            return 0;
+        };
         if available.is_empty() || buf.remaining() == 0 {
             return 0;
         }
@@ -385,11 +389,14 @@ where
                 }
                 CacheWriteState::Writing => {
                     let pending_offset = self.pending_chunk_offset;
-                    match AsyncWrite::poll_write(
-                        Pin::new(&mut self.cache_writer),
-                        cx,
-                        &chunk[pending_offset..],
-                    ) {
+                    let Some(remaining) = chunk.get(pending_offset..) else {
+                        self.cache_write_state = CacheWriteState::Idle;
+                        return Poll::Ready(Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "cache write offset out of bounds",
+                        )));
+                    };
+                    match AsyncWrite::poll_write(Pin::new(&mut self.cache_writer), cx, remaining) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(0)) => {
                             self.cache_write_state = CacheWriteState::Idle;
