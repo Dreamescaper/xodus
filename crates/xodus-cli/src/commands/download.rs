@@ -19,32 +19,32 @@ use crate::package::{get_content_id, get_packages};
 #[derive(Debug)]
 enum DownloadError {
     Network(String),
+    Host(String),
     Local(String),
-    Integrity(String),
 }
 
 impl DownloadError {
     fn should_try_next_cdn(&self) -> bool {
-        matches!(self, Self::Network(_))
+        matches!(self, Self::Network(_) | Self::Host(_))
     }
 
     fn network(error: impl fmt::Display) -> Self {
         Self::Network(error.to_string())
     }
 
-    fn local(error: impl fmt::Display) -> Self {
-        Self::Local(error.to_string())
+    fn host(error: impl fmt::Display) -> Self {
+        Self::Host(error.to_string())
     }
 
-    fn integrity(error: impl fmt::Display) -> Self {
-        Self::Integrity(error.to_string())
+    fn local(error: impl fmt::Display) -> Self {
+        Self::Local(error.to_string())
     }
 }
 
 impl fmt::Display for DownloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Network(message) | Self::Local(message) | Self::Integrity(message) => {
+            Self::Network(message) | Self::Host(message) | Self::Local(message) => {
                 f.write_str(message)
             }
         }
@@ -91,6 +91,11 @@ async fn write_validator(path: &Path, authority: &str, validator: &str) -> std::
     tokio::fs::write(path, format!("{authority}\n{validator}")).await
 }
 
+async fn remove_partial(partial_path: &Path, validator_path: &Path) {
+    let _ = tokio::fs::remove_file(partial_path).await;
+    let _ = tokio::fs::remove_file(validator_path).await;
+}
+
 fn validate_file_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("the server returned an empty file name".to_owned());
@@ -100,12 +105,20 @@ fn validate_file_name(name: &str) -> Result<(), String> {
             "unsafe file name {name:?} from the server: contains a path separator"
         ));
     }
+    if name.contains(':') || name.contains('\0') {
+        return Err(format!(
+            "unsafe file name {name:?} from the server: contains a forbidden character"
+        ));
+    }
     let path = Path::new(name);
     if path.is_absolute()
         || path.components().any(|component| {
             matches!(
                 component,
-                Component::ParentDir | Component::RootDir | Component::CurDir
+                Component::ParentDir
+                    | Component::RootDir
+                    | Component::CurDir
+                    | Component::Prefix(_)
             )
         })
     {
@@ -243,28 +256,40 @@ async fn download_file(
 
     let resuming = resume && status == StatusCode::PARTIAL_CONTENT;
     if resuming {
-        let content_range = response
+        let Some(content_range) = response
             .headers()
             .get(CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| DownloadError::integrity("resume response is missing Content-Range"))?;
+        else {
+            remove_partial(&partial_path, &validator_path).await;
+            return Err(DownloadError::host(
+                "resume response is missing Content-Range",
+            ));
+        };
         let Some((range, total)) = content_range
             .strip_prefix("bytes ")
             .and_then(|value| value.split_once('/'))
         else {
-            return Err(DownloadError::integrity(format!(
+            remove_partial(&partial_path, &validator_path).await;
+            return Err(DownloadError::host(format!(
                 "invalid Content-Range: {content_range}"
             )));
         };
         let Some((start, _)) = range.split_once('-') else {
-            return Err(DownloadError::integrity(format!(
+            remove_partial(&partial_path, &validator_path).await;
+            return Err(DownloadError::host(format!(
                 "invalid Content-Range: {content_range}"
             )));
         };
-        let start = start.parse::<u64>().map_err(DownloadError::integrity)?;
-        let total = total.parse::<u64>().map_err(DownloadError::integrity)?;
+        let (Ok(start), Ok(total)) = (start.parse::<u64>(), total.parse::<u64>()) else {
+            remove_partial(&partial_path, &validator_path).await;
+            return Err(DownloadError::host(format!(
+                "invalid Content-Range: {content_range}"
+            )));
+        };
         if start != existing_size || total != expected_size {
-            return Err(DownloadError::integrity(format!(
+            remove_partial(&partial_path, &validator_path).await;
+            return Err(DownloadError::host(format!(
                 "invalid Content-Range for resume: {content_range}"
             )));
         }
@@ -324,7 +349,10 @@ async fn download_file(
         .map_err(DownloadError::local)?
         .len();
     if actual_size != expected_size {
-        return Err(DownloadError::integrity(format!(
+        if resuming {
+            remove_partial(&partial_path, &validator_path).await;
+        }
+        return Err(DownloadError::host(format!(
             "download ended with {actual_size} bytes; expected {expected_size}"
         )));
     }
@@ -452,7 +480,7 @@ mod tests {
 
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
 
     use super::{download_file, download_from_any, url_authority, validate_file_name};
@@ -463,57 +491,116 @@ mod tests {
         if_range: Option<String>,
     }
 
+    struct ServedResponse {
+        body: Vec<u8>,
+        status: &'static str,
+        content_range: Option<String>,
+        etag: Option<&'static str>,
+        content_length: Option<usize>,
+    }
+
+    impl ServedResponse {
+        fn new(body: Vec<u8>, status: &'static str) -> Self {
+            Self {
+                body,
+                status,
+                content_range: None,
+                etag: None,
+                content_length: None,
+            }
+        }
+
+        fn with_content_range(mut self, content_range: impl Into<String>) -> Self {
+            self.content_range = Some(content_range.into());
+            self
+        }
+
+        fn with_etag(mut self, etag: &'static str) -> Self {
+            self.etag = Some(etag);
+            self
+        }
+
+        fn with_content_length(mut self, content_length: usize) -> Self {
+            self.content_length = Some(content_length);
+            self
+        }
+    }
+
+    async fn handle_connection(mut socket: TcpStream, response: ServedResponse) -> RequestInfo {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let size = socket.read(&mut buffer).await.unwrap();
+            assert!(size > 0, "client closed before sending its headers");
+            request.extend_from_slice(&buffer[..size]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            assert!(request.len() < 8192);
+        }
+        let request = String::from_utf8_lossy(&request);
+        let header = |name: &str| {
+            request.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
+            })
+        };
+        let info = RequestInfo {
+            range: header("range"),
+            if_range: header("if-range"),
+        };
+
+        let content_length = response.content_length.unwrap_or(response.body.len());
+        let mut head = format!(
+            "HTTP/1.1 {}\r\nContent-Length: {content_length}\r\nConnection: close\r\n",
+            response.status
+        );
+        if let Some(content_range) = response.content_range {
+            head.push_str(&format!("Content-Range: {content_range}\r\n"));
+        }
+        if let Some(etag) = response.etag {
+            head.push_str(&format!("ETag: {etag}\r\n"));
+        }
+        head.push_str("\r\n");
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(&response.body).await.unwrap();
+        socket.shutdown().await.unwrap();
+        info
+    }
+
+    async fn serve_sequence(
+        responses: Vec<ServedResponse>,
+    ) -> (String, JoinHandle<Vec<RequestInfo>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut infos = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (socket, _) = listener.accept().await.unwrap();
+                infos.push(handle_connection(socket, response).await);
+            }
+            infos
+        });
+        (format!("http://{address}/file"), handle)
+    }
+
     async fn serve_once(
         body: Vec<u8>,
         status: &'static str,
         content_range: Option<String>,
         etag: Option<&'static str>,
     ) -> (String, JoinHandle<RequestInfo>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            loop {
-                let size = socket.read(&mut buffer).await.unwrap();
-                assert!(size > 0, "client closed before sending its headers");
-                request.extend_from_slice(&buffer[..size]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-                assert!(request.len() < 8192);
-            }
-            let request = String::from_utf8_lossy(&request);
-            let header = |name: &str| {
-                request.lines().find_map(|line| {
-                    let (key, value) = line.split_once(':')?;
-                    key.eq_ignore_ascii_case(name)
-                        .then(|| value.trim().to_owned())
-                })
-            };
-            let info = RequestInfo {
-                range: header("range"),
-                if_range: header("if-range"),
-            };
-
-            let mut response = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                body.len()
-            );
-            if let Some(content_range) = content_range {
-                response.push_str(&format!("Content-Range: {content_range}\r\n"));
-            }
-            if let Some(etag) = etag {
-                response.push_str(&format!("ETag: {etag}\r\n"));
-            }
-            response.push_str("\r\n");
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.write_all(&body).await.unwrap();
-            socket.shutdown().await.unwrap();
-            info
-        });
-        (format!("http://{address}/file"), handle)
+        let (url, handles) = serve_sequence(vec![ServedResponse {
+            body,
+            status,
+            content_range,
+            etag,
+            content_length: None,
+        }])
+        .await;
+        let handle = tokio::spawn(async move { handles.await.unwrap().pop().unwrap() });
+        (url, handle)
     }
 
     fn progress(position: u64) -> indicatif::ProgressBar {
@@ -730,7 +817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_content_range_is_rejected_without_modifying_the_partial_file() {
+    async fn invalid_content_range_deletes_partial_and_validator() {
         let data = b"suffix".to_vec();
         let (url, server) = serve_once(
             data,
@@ -755,11 +842,97 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("Content-Range"));
-        assert_eq!(
-            tokio::fs::read(partial_path(&path)).await.unwrap(),
-            original
-        );
+        assert!(!partial_path(&path).exists());
+        assert!(!validator_path(&path).exists());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn short_resumed_body_deletes_partial_and_validator() {
+        let (url, server) = serve_once(
+            b"ab".to_vec(),
+            "206 Partial Content",
+            Some("bytes 8-9/12".to_string()),
+            None,
+        )
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("file");
+        let authority = url_authority(&url).unwrap();
+        write_partial(&path, b"01234567", Some(&authority), "\"v1\"").await;
+
+        let error = download_file(&reqwest::Client::new(), &url, &path, 12, &progress(8))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expected 12"), "{error}");
+        assert!(!partial_path(&path).exists());
+        assert!(!validator_path(&path).exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_clears_partial_and_retries_without_range() {
+        let data = b"complete payload".to_vec();
+        let split = 8;
+        let (url, server) = serve_sequence(vec![
+            ServedResponse::new(Vec::new(), "416 Range Not Satisfiable"),
+            ServedResponse::new(data.clone(), "200 OK").with_etag("\"v1\""),
+        ])
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("file");
+        let authority = url_authority(&url).unwrap();
+        write_partial(&path, &data[..split], Some(&authority), "\"old\"").await;
+
+        download_file(
+            &reqwest::Client::new(),
+            &url,
+            &path,
+            data.len() as u64,
+            &progress(split as u64),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), data);
+        let infos = server.await.unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].range.as_deref(), Some("bytes=8-"));
+        assert_eq!(infos[0].if_range.as_deref(), Some("\"old\""));
+        assert_eq!(infos[1].range, None);
+        assert_eq!(infos[1].if_range, None);
+    }
+
+    #[tokio::test]
+    async fn resumed_206_keeps_the_existing_validator() {
+        let data = b"complete payload".to_vec();
+        let split = 8;
+        let response = ServedResponse::new(data[split..].to_vec(), "206 Partial Content")
+            .with_content_range(format!("bytes {split}-{}/{}", data.len() - 1, data.len()))
+            .with_etag("\"new\"")
+            .with_content_length(data.len() - split + 4);
+        let (url, server) = serve_sequence(vec![response]).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("file");
+        let authority = url_authority(&url).unwrap();
+        write_partial(&path, &data[..split], Some(&authority), "\"old\"").await;
+
+        download_file(
+            &reqwest::Client::new(),
+            &url,
+            &path,
+            data.len() as u64,
+            &progress(split as u64),
+        )
+        .await
+        .unwrap_err();
+        let info = server.await.unwrap();
+        assert_eq!(info[0].if_range.as_deref(), Some("\"old\""));
+        assert_eq!(
+            tokio::fs::read_to_string(validator_path(&path))
+                .await
+                .unwrap(),
+            format!("{authority}\n\"old\"")
+        );
     }
 
     #[tokio::test]
@@ -777,6 +950,28 @@ mod tests {
             b"short"
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_next_cdn_after_a_short_response() {
+        let data = b"complete payload".to_vec();
+        let (short_url, short) = serve_once(b"short".to_vec(), "200 OK", None, None).await;
+        let (good_url, good) = serve_once(data.clone(), "200 OK", None, Some("\"v1\"")).await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("file");
+
+        download_from_any(
+            &reqwest::Client::new(),
+            &[short_url, good_url],
+            &path,
+            data.len() as u64,
+            &progress(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), data);
+        short.await.unwrap();
+        good.await.unwrap();
     }
 
     #[tokio::test]
@@ -862,6 +1057,9 @@ mod tests {
             "a/b",
             "a\\b",
             "/tmp/game.msixvc",
+            "C:foo",
+            "a:stream",
+            "nul\0byte",
         ] {
             assert!(
                 validate_file_name(name).is_err(),
