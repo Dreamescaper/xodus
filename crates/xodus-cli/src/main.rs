@@ -97,6 +97,13 @@ enum SubCommand {
             help = "Sub-product id to use when the product only lists its packages through other products"
         )]
         sub_product: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "human",
+            help = "Progress output: human bars or schema-versioned JSON lines"
+        )]
+        progress: commands::streaming::ProgressMode,
     },
     #[cfg(unix)]
     #[command(about = "Run a Game with xodus wine")]
@@ -283,6 +290,7 @@ async fn main() -> ExitCode {
             market,
             parallel,
             sub_product,
+            progress,
         } => {
             let options = commands::streaming::StreamingOptions {
                 try_skip_ntfs,
@@ -292,6 +300,7 @@ async fn main() -> ExitCode {
                     sub_product,
                     non_interactive,
                 },
+                progress,
             };
             commands::streaming::run(&client, &tokens, source, destination, options).await
         }
@@ -362,6 +371,7 @@ mod tests {
 #[cfg(test)]
 mod cli_tests {
     use super::{CliArgs, SubCommand, env_flag_value};
+    use crate::commands::streaming::ProgressMode;
     use clap::Parser;
 
     #[test]
@@ -441,6 +451,30 @@ mod cli_tests {
             SubCommand::Streaming { sub_product, .. } => {
                 assert_eq!(sub_product.as_deref(), Some("9ABCDEF12345"));
             }
+            _ => panic!("expected the streaming subcommand"),
+        }
+    }
+
+    #[test]
+    fn streaming_progress_defaults_to_human_and_accepts_json() {
+        let default = CliArgs::try_parse_from(["xodus-cli", "streaming", "SRC", "DEST"])
+            .expect("failed to parse streaming arguments");
+        match default.command {
+            SubCommand::Streaming { progress, .. } => assert_eq!(progress, ProgressMode::Human),
+            _ => panic!("expected the streaming subcommand"),
+        }
+
+        let json = CliArgs::try_parse_from([
+            "xodus-cli",
+            "streaming",
+            "SRC",
+            "DEST",
+            "--progress",
+            "json",
+        ])
+        .expect("failed to parse JSON progress");
+        match json.command {
+            SubCommand::Streaming { progress, .. } => assert_eq!(progress, ProgressMode::Json),
             _ => panic!("expected the streaming subcommand"),
         }
     }

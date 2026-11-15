@@ -19,14 +19,24 @@ use xodus::tokens::TokenManager;
 use crate::license::get_license;
 use crate::package::{SelectionOptions, get_content_id, get_packages};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProgressMode {
+    #[default]
+    Human,
+    Json,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StreamingOptions {
     pub try_skip_ntfs: bool,
     pub parallel: Option<usize>,
     pub market: Option<String>,
     pub selection: SelectionOptions,
+    pub progress: ProgressMode,
 }
 
+#[path = "streaming_progress.rs"]
+mod progress;
 #[path = "streaming_resume.rs"]
 mod resume;
 
@@ -36,11 +46,40 @@ struct Job {
 }
 
 enum ProgressEvent {
-    Started { id: usize, name: String, total: u64 },
-    Advanced { id: usize, delta: u64 },
-    Finished { id: usize },
-    UpdateRemaining { name: String, total: u64 },
-    UpdateStatus { name: String },
+    Started {
+        id: usize,
+        name: String,
+        total: u64,
+    },
+    /// Bytes restored from a checkpoint before new network reads begin.
+    Restored {
+        id: usize,
+        delta: u64,
+    },
+    Advanced {
+        id: usize,
+        delta: u64,
+    },
+    Finished {
+        id: usize,
+    },
+    UpdateRemaining {
+        name: String,
+        total: u64,
+    },
+    UpdateStatus {
+        name: String,
+    },
+    Planned {
+        total: u64,
+        saved: u64,
+        files: usize,
+    },
+    Failed {
+        kind: progress::FailureKind,
+        message: String,
+    },
+    Completed,
 }
 
 const PROGRESS_TEMPLATE: &str = "{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%";
@@ -83,6 +122,18 @@ fn progress_name(path: &str) -> String {
     format!("...{}", &path[start..])
 }
 
+fn report_failure(progress_json: bool, kind: progress::FailureKind, message: &str) {
+    if progress_json {
+        progress::emit_error(kind, message);
+    }
+}
+
+fn report_error(progress_json: bool, error: &(dyn std::error::Error + 'static)) {
+    if progress_json {
+        progress::emit_error(progress::classify_failure(error), &error.to_string());
+    }
+}
+
 pub async fn run(
     client: &reqwest::Client,
     tokens: &TokenManager,
@@ -95,7 +146,9 @@ pub async fn run(
         parallel,
         market,
         selection,
+        progress: progress_mode,
     } = options;
+    let progress_json = progress_mode == ProgressMode::Json;
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
     if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
@@ -103,6 +156,11 @@ pub async fn run(
             Ok(f) => f,
             Err(err) => {
                 eprintln!("could not open {fsrc}: {err}");
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Other,
+                    "could not open the streaming source",
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -110,6 +168,11 @@ pub async fn run(
             Ok(metadata) => metadata.len(),
             Err(err) => {
                 eprintln!("could not read metadata for {fsrc}: {err}");
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Other,
+                    "could not read the streaming source",
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -129,6 +192,7 @@ pub async fn run(
             l,
             tx,
             rx,
+            progress_json,
         )
         .await
     } else {
@@ -141,9 +205,15 @@ pub async fn run(
                 let Ok(content_id) = content_id_task else {
                     let Err(err) = content_id_task else {
                         eprintln!("Unknown Error");
+                        report_failure(
+                            progress_json,
+                            progress::FailureKind::Other,
+                            "unknown error",
+                        );
                         return ExitCode::FAILURE;
                     };
-                    eprintln!("{}", err);
+                    eprintln!("{err}");
+                    report_error(progress_json, err.as_ref());
                     return ExitCode::FAILURE;
                 };
                 content_id
@@ -154,9 +224,13 @@ pub async fn run(
             let Ok(package) = package_result else {
                 let Err(err) = package_result else {
                     eprintln!("Unknown Error");
+                    report_failure(progress_json, progress::FailureKind::Other, "unknown error");
                     return ExitCode::FAILURE;
                 };
                 eprintln!("{}", err);
+                if progress_json {
+                    progress::emit_error(progress::classify_failure(&err), &err.to_string());
+                }
                 return ExitCode::FAILURE;
             };
             let Some(file) = package
@@ -165,17 +239,32 @@ pub async fn run(
                 .find(|p| p.file_name.ends_with(".msixvc"))
             else {
                 eprintln!("No .msixvc file found");
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Other,
+                    "the package has no streaming image",
+                );
                 return ExitCode::FAILURE;
             };
             let urls = file.download_urls();
             if urls.is_empty() {
                 eprintln!("The server returned no CDN for {}", file.file_name);
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Network,
+                    "the server returned no download host",
+                );
                 return ExitCode::FAILURE;
             }
             urls
         };
         let Some(first_url) = urls.first() else {
             eprintln!("The server returned no CDN for the package");
+            report_failure(
+                progress_json,
+                progress::FailureKind::Network,
+                "the server returned no download host",
+            );
             return ExitCode::FAILURE;
         };
         let mut pos = 0;
@@ -204,6 +293,11 @@ pub async fn run(
                     source_label(first_url),
                     err
                 );
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Network,
+                    "could not open the streaming source",
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -224,6 +318,7 @@ pub async fn run(
             l,
             tx,
             rx,
+            progress_json,
         )
         .await
     }
@@ -244,11 +339,16 @@ async fn run_cli_reader<Reader>(
     expected_total: u64,
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
+    progress_json: bool,
 ) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
-    let progress_task = tokio::spawn(async move {
+    let reporter = tokio::spawn(async move {
+        if progress_json {
+            progress::report(rx).await;
+            return;
+        }
         let multi_progress = MultiProgress::new();
         let total_progess = multi_progress.add(ProgressBar::new(l).with_style(progress_style()));
 
@@ -263,7 +363,7 @@ where
                     cur_progess.set_message(name);
                     bars.insert(id, cur_progess);
                 }
-                ProgressEvent::Advanced { id, delta } => {
+                ProgressEvent::Restored { id, delta } | ProgressEvent::Advanced { id, delta } => {
                     if let Some(bar) = bars.get(&id) {
                         bar.inc(delta);
                     }
@@ -281,12 +381,14 @@ where
                 ProgressEvent::UpdateStatus { name } => {
                     total_progess.set_message(name);
                 }
+                ProgressEvent::Planned { .. } => {}
+                ProgressEvent::Completed | ProgressEvent::Failed { .. } => break,
             }
         }
 
         total_progess.abandon();
     });
-    let status = run_reader(
+    let outcome = run_reader(
         client,
         tokens,
         destination,
@@ -301,8 +403,23 @@ where
         &tx,
     )
     .await;
+    let status = match outcome {
+        Ok(()) => {
+            tx.send(ProgressEvent::Completed).await.ok();
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            tx.send(ProgressEvent::Failed {
+                kind: failure.kind,
+                message: failure.message,
+            })
+            .await
+            .ok();
+            ExitCode::FAILURE
+        }
+    };
     drop(tx);
-    let _ = progress_task.await;
+    let _ = reporter.await;
     status
 }
 
@@ -320,7 +437,7 @@ async fn run_reader<Reader>(
     preferred_host: Arc<AtomicUsize>,
     expected_total: u64,
     tx: &Sender<ProgressEvent>,
-) -> ExitCode
+) -> Result<(), progress::StreamingFailure>
 where
     Reader: AsyncRead + Unpin,
 {
@@ -329,14 +446,18 @@ where
 
     if let Err(err) = std::fs::create_dir_all(out) {
         eprintln!("could not create destination {}: {err}", out.display());
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "could not create the destination folder",
+        ));
     }
 
     let _folder_lock = match resume::lock(out) {
         Ok(lock) => lock,
         Err(err) => {
             eprintln!("cannot start this download: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "another download is using the destination folder",
+            ));
         }
     };
 
@@ -351,7 +472,9 @@ where
                 "could not create streaming cache {}: {err}",
                 cache_path.display()
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not create the streaming cache",
+            ));
         }
     };
     let remote_xvd = match XvdFile::parse(&mut remote_file).await {
@@ -361,7 +484,9 @@ where
                 "could not parse streaming package from {}: {error}",
                 source_label(source_url)
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not read the streaming package",
+            ));
         }
     };
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
@@ -374,7 +499,9 @@ where
                 "could not read the package file list from {}: {error}",
                 source_label(source_url)
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not read the package file list",
+            ));
         }
     };
     for (k, v) in &files {
@@ -386,7 +513,9 @@ where
                         "could not read {k} from {}: {error}",
                         source_label(source_url)
                     );
-                    return ExitCode::FAILURE;
+                    return Err(progress::StreamingFailure::other(
+                        "could not read the package metadata",
+                    ));
                 }
             };
             rfiles = sfiles;
@@ -409,7 +538,9 @@ where
                     "could not read NTFS metadata from {}: {error}",
                     source_label(source_url)
                 );
-                return ExitCode::FAILURE;
+                return Err(progress::StreamingFailure::other(
+                    "could not read the NTFS metadata",
+                ));
             }
         };
         rfiles.extend(sfiles);
@@ -429,7 +560,9 @@ where
                     "could not parse existing package {}: {error}",
                     final_path.display()
                 );
-                return ExitCode::FAILURE;
+                return Err(progress::StreamingFailure::other(
+                    "could not read the existing package",
+                ));
             }
         };
 
@@ -440,7 +573,9 @@ where
                     "could not read the package file list from {}: {error}",
                     final_path.display()
                 );
-                return ExitCode::FAILURE;
+                return Err(progress::StreamingFailure::other(
+                    "could not read the existing package file list",
+                ));
             }
         };
         for (k, v) in &files {
@@ -449,7 +584,9 @@ where
                     Ok(files) => files,
                     Err(error) => {
                         eprintln!("could not read {k} from {}: {error}", final_path.display());
-                        return ExitCode::FAILURE;
+                        return Err(progress::StreamingFailure::other(
+                            "could not read the existing package metadata",
+                        ));
                     }
                 };
                 lfiles = sfiles;
@@ -464,6 +601,11 @@ where
         }
     }
 
+    tx.send(ProgressEvent::UpdateStatus {
+        name: "Licensing".to_owned(),
+    })
+    .await
+    .ok();
     let license = get_license(
         client,
         tokens,
@@ -475,7 +617,7 @@ where
         Ok(license) => license,
         Err(err) => {
             eprintln!("{err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::from_command(err));
         }
     };
     if game_splicense.content_keys.len() != 1 {
@@ -483,10 +625,14 @@ where
             "unexpected number of content keys {}",
             game_splicense.content_keys.len()
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "the package license has an unexpected content key count",
+        ));
     }
     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "the package license has no content key",
+        ));
     };
 
     let full_key = match content_key.unpack(&key) {
@@ -496,7 +642,9 @@ where
                 "could not unpack the content key for {}: {err}",
                 remote_xvd.content_id()
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not unpack the package content key",
+            ));
         }
     };
 
@@ -504,14 +652,18 @@ where
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("could not prepare download checkpoints: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not prepare download checkpoints",
+            ));
         }
     };
     let journal = match resume::Journal::open_with_identity(out, &identity) {
         Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
         Err(err) => {
             eprintln!("could not open download checkpoints: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not open download checkpoints",
+            ));
         }
     };
 
@@ -556,7 +708,9 @@ where
         Ok(offsets) => offsets,
         Err(err) => {
             eprintln!("could not read download checkpoints: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not read download checkpoints",
+            ));
         }
     };
     let saved: u64 = offsets.values().sum();
@@ -570,7 +724,9 @@ where
                 out.display(),
                 err
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not determine the available disk space",
+            ));
         }
     };
 
@@ -582,9 +738,18 @@ where
             available_free_space,
             total_size
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "not enough free disk space for the package",
+        ));
     }
 
+    tx.send(ProgressEvent::Planned {
+        total: total_size,
+        saved,
+        files: jobs.len(),
+    })
+    .await
+    .ok();
     tx.send(ProgressEvent::UpdateRemaining {
         name: "Downloading".to_owned(),
         total: total_size,
@@ -603,12 +768,14 @@ where
             "could not remove previous streaming package {}: {err}",
             final_path.display()
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "could not remove the previous streaming package",
+        ));
     }
 
     let segments = stream::iter(jobs)
         .enumerate()
-        .map(Ok::<_, String>)
+        .map(Ok::<_, progress::StreamingFailure>)
         .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
             let tx = tx.clone();
             let client = client.clone();
@@ -635,11 +802,13 @@ where
         })
         .await;
 
-    if let Err(err) = segments {
-        eprintln!("{err}");
-        return ExitCode::FAILURE;
-    }
+    segments?;
 
+    tx.send(ProgressEvent::UpdateStatus {
+        name: "Finalizing".to_owned(),
+    })
+    .await
+    .ok();
     std::fs::remove_file(&final_path).ok();
     if let Err(err) = std::fs::rename(&cache_path, &final_path) {
         eprintln!(
@@ -647,21 +816,22 @@ where
             cache_path.display(),
             final_path.display()
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "could not finalize the streaming package",
+        ));
     }
     let _ = std::fs::remove_file(out.join(resume::JOURNAL_FILE));
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 async fn checkpoint_blocking(
     journal: Arc<std::sync::Mutex<resume::Journal>>,
     name: String,
     offset: u64,
-) -> Result<(), String> {
+) -> Result<(), progress::StreamingFailure> {
     if offset == 0 {
         return Ok(());
     }
-    let label = name.clone();
     tokio::task::spawn_blocking(move || {
         journal
             .lock()
@@ -669,8 +839,12 @@ async fn checkpoint_blocking(
             .checkpoint(&name, offset)
     })
     .await
-    .map_err(|err| format!("checkpoint task failed for {label}: {err}"))?
-    .map_err(|err| format!("could not checkpoint segment {label}: {err}"))
+    .map_err(|err| {
+        progress::StreamingFailure::other(format!("download checkpoint task failed: {err}"))
+    })?
+    .map_err(|err| {
+        progress::StreamingFailure::other(format!("could not save a download checkpoint: {err}"))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -687,17 +861,27 @@ async fn download_segment(
     journal: Arc<std::sync::Mutex<resume::Journal>>,
     preferred_host: Arc<AtomicUsize>,
     expected_total: u64,
-) -> Result<(), String> {
+) -> Result<(), progress::StreamingFailure> {
     let url = urls.first().map(String::as_str).unwrap_or("<unknown>");
-    let target_file = resume::target(out, &job.name)
-        .map_err(|err| format!("invalid segment path {}: {err}", job.name))?;
+    let target_file = match resume::target(out, &job.name) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("invalid segment path {}: {err}", job.name);
+            return Err(progress::StreamingFailure::other(
+                "invalid package file path",
+            ));
+        }
+    };
     if let Some(folder) = target_file.parent()
         && let Err(err) = std::fs::create_dir_all(folder)
     {
-        return Err(format!(
+        eprintln!(
             "could not create directory {} for segment {}: {err}",
             folder.display(),
             job.name
+        );
+        return Err(progress::StreamingFailure::other(
+            "could not create a package folder",
         ));
     }
     let mut fout = match OpenOptions::new()
@@ -709,10 +893,13 @@ async fn download_segment(
     {
         Ok(file) => file,
         Err(err) => {
-            return Err(format!(
+            eprintln!(
                 "could not create {} for segment {}: {err}",
                 target_file.display(),
                 job.name
+            );
+            return Err(progress::StreamingFailure::other(
+                "could not create a package file",
             ));
         }
     };
@@ -724,10 +911,13 @@ async fn download_segment(
     let offset = match resume::prepare_output(&mut fout, offset, &job.content).await {
         Ok(offset) => offset,
         Err(err) => {
-            return Err(format!(
+            eprintln!(
                 "could not prepare {} for segment {}: {err}",
                 target_file.display(),
                 job.name
+            );
+            return Err(progress::StreamingFailure::other(
+                "could not prepare a package file",
             ));
         }
     };
@@ -752,7 +942,7 @@ async fn download_segment(
     })
     .await
     .ok();
-    tx.send(ProgressEvent::Advanced { id, delta: offset })
+    tx.send(ProgressEvent::Restored { id, delta: offset })
         .await
         .ok();
 
@@ -767,18 +957,24 @@ async fn download_segment(
         let mut i = match File::open(fpath).await {
             Ok(file) => file,
             Err(err) => {
-                return Err(format!(
+                eprintln!(
                     "could not open source package {fpath} for segment {}: {err}",
                     job.name
+                );
+                return Err(progress::StreamingFailure::other(
+                    "could not open the local package source",
                 ));
             }
         };
         remote_xvd
             .extract_file(&mut i, &mut fout, &job.content, full_key, progress)
             .await
-            .map_err(|err| format!("could not extract segment {} from {fpath}: {err}", job.name))?;
+            .map_err(|err| {
+                eprintln!("could not extract segment {} from {fpath}: {err}", job.name);
+                progress::StreamingFailure::other("could not extract a package segment")
+            })?;
     } else {
-        remote_xvd
+        let result = remote_xvd
             .download_file_http(
                 client,
                 urls,
@@ -800,14 +996,17 @@ async fn download_segment(
                 preferred_host,
                 expected_total,
             )
-            .await
-            .map_err(|err| {
-                format!(
-                    "could not download segment {} from {}: {err}",
-                    job.name,
-                    source_label(url)
-                )
-            })?;
+            .await;
+        if let Err(err) = result {
+            eprintln!(
+                "could not download segment {} from {}: {err}",
+                job.name,
+                source_label(url)
+            );
+            return Err(progress::StreamingFailure::network(
+                "could not download a package segment",
+            ));
+        }
     }
     tx.send(ProgressEvent::Finished { id }).await.ok();
     Ok(())
