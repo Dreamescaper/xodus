@@ -5,6 +5,8 @@ use xodus::models::packagespc::{PackageDetails, PackageResponse};
 use xodus::models::secrets::Token;
 use xodus::tokens::TokenManager;
 
+use crate::error::CommandError;
+
 pub async fn get_content_id(
     client: &reqwest::Client,
     product: String,
@@ -16,7 +18,8 @@ pub async fn get_content_id(
         market.clone().unwrap_or("neutral".to_owned()),
         vec!["en".to_string(), "neutral".to_string()],
     )
-    .await?;
+    .await
+    .map_err(|err| std::io::Error::other(err.without_url()))?;
 
     let product_details = displaycatalog.product;
 
@@ -78,14 +81,18 @@ pub async fn get_packages(
     client: &reqwest::Client,
     tokens: &TokenManager,
     content_id: String,
-) -> Result<PackageDetails, Box<dyn std::error::Error>> {
-    let dev_token = tokens.get_device_sts_token().unwrap();
+) -> Result<PackageDetails, CommandError> {
+    let dev_token = tokens.get_device_sts_token().map_err(|err| {
+        CommandError::auth_from(format!("could not read the device token: {err}"), err)
+    })?;
     let Token::Legacy(dev_token) = dev_token else {
-        return Err(Box::new(std::io::Error::other("Invalid STS token")));
+        return Err(CommandError::auth("Invalid STS token"));
     };
-    let user_token = tokens.get_user_sts_token().unwrap();
+    let user_token = tokens.get_user_sts_token().map_err(|err| {
+        CommandError::auth_from(format!("could not read the user token: {err}"), err)
+    })?;
     let Token::Legacy(legacy) = user_token else {
-        return Err(Box::new(std::io::Error::other("Unsupported user token")));
+        return Err(CommandError::auth("Unsupported user token"));
     };
 
     let xsts_token =
@@ -102,14 +109,20 @@ pub async fn get_packages(
         )
         .send()
         .await
-        .unwrap();
+        .map_err(|err| {
+            let err = err.without_url();
+            CommandError::network_from(format!("could not request the package list: {err}"), err)
+        })?;
 
-    let res: PackageResponse = response.json().await.expect("Failed to get data");
+    let res: PackageResponse = response.json().await.map_err(|err| {
+        let err = err.without_url();
+        CommandError::network_from(format!("could not read the package list: {err}"), err)
+    })?;
 
     let PackageResponse::Found(package) = res else {
-        return Err(Box::new(std::io::Error::other(
+        return Err(CommandError::other(
             "Package was not found, is it owned by the user?",
-        )));
+        ));
     };
     Ok(package)
 }

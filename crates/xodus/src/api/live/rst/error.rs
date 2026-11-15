@@ -27,6 +27,19 @@ pub enum RSTError {
     InvalidResponseSignature(String),
 }
 
+impl RSTError {
+    pub fn without_url(self) -> Self {
+        match self {
+            Self::Request(error) => Self::Request(error.without_url()),
+            other => other,
+        }
+    }
+
+    pub fn is_network_request(&self) -> bool {
+        matches!(self, Self::Request(_))
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum RSTBuilderError {
     #[error("Error serializing request")]

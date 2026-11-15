@@ -118,7 +118,11 @@ impl<'t> HttpRead<'t> {
             return 0;
         };
 
-        let available = &chunk[self.pending_chunk_offset..];
+        let Some(available) = chunk.get(self.pending_chunk_offset..) else {
+            self.pending_chunk = None;
+            self.pending_chunk_offset = 0;
+            return 0;
+        };
         if available.is_empty() || buf.remaining() == 0 {
             return 0;
         }
@@ -385,11 +389,14 @@ where
                 }
                 CacheWriteState::Writing => {
                     let pending_offset = self.pending_chunk_offset;
-                    match AsyncWrite::poll_write(
-                        Pin::new(&mut self.cache_writer),
-                        cx,
-                        &chunk[pending_offset..],
-                    ) {
+                    let Some(remaining) = chunk.get(pending_offset..) else {
+                        self.cache_write_state = CacheWriteState::Idle;
+                        return Poll::Ready(Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "cache write offset out of bounds",
+                        )));
+                    };
+                    match AsyncWrite::poll_write(Pin::new(&mut self.cache_writer), cx, remaining) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(0)) => {
                             self.cache_write_state = CacheWriteState::Idle;
@@ -659,7 +666,7 @@ async fn open_http_stream(
 }
 
 fn http_err(err: reqwest::Error) -> std::io::Error {
-    Error::other(err)
+    Error::other(err.without_url())
 }
 
 #[cfg(test)]
@@ -853,6 +860,44 @@ mod tests {
             .unwrap();
         let len = http.len();
         PrefixCacheFile::new(http, len, cache).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn signed_url_is_not_leaked_in_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let url = format!("http://{address}/file?sig=secret");
+        let error = match HttpRead::open(reqwest::Client::new(), &url, Some(|_, _| {})).await {
+            Ok(_) => panic!("the server must reject the request"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(!message.contains("secret"), "{message}");
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
