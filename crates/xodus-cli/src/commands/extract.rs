@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use xodus::tokens::TokenManager;
 
-use crate::commands::streaming;
+use crate::commands::streaming::{self, StreamingOptions};
 
 pub async fn run(
     client: &reqwest::Client,
@@ -16,9 +16,10 @@ pub async fn run(
         tokens,
         "file://".to_owned() + &path,
         destination,
-        false,
-        None,
-        Some(market),
+        StreamingOptions {
+            market: Some(market),
+            ..Default::default()
+        },
     )
     .await
 }

@@ -10,6 +10,15 @@ pub struct DisplayCatalogProductsResponse {
 #[serde(rename_all = "PascalCase")]
 pub struct Product {
     pub display_sku_availabilities: Vec<DisplaySkuAvailability>,
+    #[serde(default)]
+    pub localized_properties: Option<Vec<LocalizedProperties>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LocalizedProperties {
+    #[serde(default)]
+    pub product_title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

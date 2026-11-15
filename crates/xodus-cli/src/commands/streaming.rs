@@ -17,7 +17,15 @@ use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
-use crate::package::{get_content_id, get_packages};
+use crate::package::{SelectionOptions, get_content_id, get_packages};
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamingOptions {
+    pub try_skip_ntfs: bool,
+    pub parallel: Option<usize>,
+    pub market: Option<String>,
+    pub selection: SelectionOptions,
+}
 
 #[path = "streaming_resume.rs"]
 mod resume;
@@ -80,10 +88,14 @@ pub async fn run(
     tokens: &TokenManager,
     source: String,
     destination: String,
-    try_skip_ntfs: bool,
-    parallel: Option<usize>,
-    market: Option<String>,
+    options: StreamingOptions,
 ) -> ExitCode {
+    let StreamingOptions {
+        try_skip_ntfs,
+        parallel,
+        market,
+        selection,
+    } = options;
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
     if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
@@ -124,7 +136,8 @@ pub async fn run(
             vec![source]
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
-                let content_id_task = get_content_id(client, source, market.clone()).await;
+                let content_id_task =
+                    get_content_id(client, source, market.clone(), &selection).await;
                 let Ok(content_id) = content_id_task else {
                     let Err(err) = content_id_task else {
                         eprintln!("Unknown Error");
@@ -814,9 +827,10 @@ mod tests {
             &tokens,
             source,
             destination.to_string_lossy().into_owned(),
-            true,
-            None,
-            None,
+            StreamingOptions {
+                try_skip_ntfs: true,
+                ..Default::default()
+            },
         )
         .await
     }

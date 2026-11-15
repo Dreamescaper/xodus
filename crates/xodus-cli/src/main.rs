@@ -12,6 +12,8 @@ mod license;
 mod package;
 mod webview;
 
+use package::SelectionOptions;
+
 #[derive(Subcommand)]
 enum SubCommand {
     #[command(about = "Download msixvc or xsp files fo given game")]
@@ -25,6 +27,25 @@ enum SubCommand {
             help = "Display download URLs instead of downloading"
         )]
         dry_run: bool,
+        #[arg(
+            long,
+            value_name = "ID",
+            help = "Sub-product id to use when the product only lists its packages through other products"
+        )]
+        sub_product: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Download every package file instead of asking"
+        )]
+        all_files: bool,
+        #[arg(
+            long = "file",
+            value_name = "NAME",
+            conflicts_with = "all_files",
+            help = "Download only this package file (repeatable)"
+        )]
+        files: Vec<String>,
     },
     #[command(about = "Dump CIKs for use with XvdTool")]
     License {
@@ -70,6 +91,12 @@ enum SubCommand {
         parallel: Option<usize>,
         #[arg(short, long)]
         market: Option<String>,
+        #[arg(
+            long,
+            value_name = "ID",
+            help = "Sub-product id to use when the product only lists its packages through other products"
+        )]
+        sub_product: Option<String>,
     },
     #[cfg(unix)]
     #[command(about = "Run a Game with xodus wine")]
@@ -122,8 +149,29 @@ enum ClepAction {
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct CliArgs {
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Never prompt for a choice; fail with the available choices instead. Also enabled by XODUS_NON_INTERACTIVE=1"
+    )]
+    non_interactive: bool,
     #[command(subcommand)]
     command: SubCommand,
+}
+
+fn env_flag(name: &str) -> bool {
+    let value = std::env::var(name).ok();
+    env_flag_value(value.as_deref())
+}
+
+fn env_flag_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 #[tokio::main]
@@ -153,6 +201,7 @@ async fn main() -> ExitCode {
         .build()
         .unwrap();
     let args = CliArgs::parse();
+    let non_interactive = args.non_interactive || env_flag("XODUS_NON_INTERACTIVE");
 
     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
     let tokens = TokenManager::with_keychain_and_memory();
@@ -176,7 +225,22 @@ async fn main() -> ExitCode {
             product,
             market,
             dry_run,
-        } => commands::download::run(&client, &tokens, product, market, dry_run).await,
+            sub_product,
+            all_files,
+            files,
+        } => {
+            let options = commands::download::DownloadOptions {
+                market,
+                dry_run,
+                selection: SelectionOptions {
+                    sub_product,
+                    non_interactive,
+                },
+                all_files,
+                files,
+            };
+            commands::download::run(&client, &tokens, product, options).await
+        }
         SubCommand::License {
             content_id,
             market,
@@ -218,17 +282,18 @@ async fn main() -> ExitCode {
             try_skip_ntfs,
             market,
             parallel,
+            sub_product,
         } => {
-            commands::streaming::run(
-                &client,
-                &tokens,
-                source,
-                destination,
+            let options = commands::streaming::StreamingOptions {
                 try_skip_ntfs,
                 parallel,
                 market,
-            )
-            .await
+                selection: SelectionOptions {
+                    sub_product,
+                    non_interactive,
+                },
+            };
+            commands::streaming::run(&client, &tokens, source, destination, options).await
         }
         #[cfg(unix)]
         SubCommand::Run {
@@ -290,6 +355,125 @@ mod tests {
         match args.command {
             SubCommand::Run { game_args, .. } => assert!(game_args.is_empty()),
             _ => panic!("expected the run subcommand"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{CliArgs, SubCommand, env_flag_value};
+    use clap::Parser;
+
+    #[test]
+    fn download_parses_selection_flags() {
+        let args = CliArgs::try_parse_from([
+            "xodus-cli",
+            "download",
+            "PRODUCT",
+            "--sub-product",
+            "9ABCDEF12345",
+            "--all-files",
+        ])
+        .expect("failed to parse download arguments");
+
+        match args.command {
+            SubCommand::Download {
+                sub_product,
+                all_files,
+                files,
+                ..
+            } => {
+                assert_eq!(sub_product.as_deref(), Some("9ABCDEF12345"));
+                assert!(all_files);
+                assert!(files.is_empty());
+            }
+            _ => panic!("expected the download subcommand"),
+        }
+    }
+
+    #[test]
+    fn download_accepts_repeated_file_flags() {
+        let args = CliArgs::try_parse_from([
+            "xodus-cli",
+            "download",
+            "PRODUCT",
+            "--file",
+            "a.msixvc",
+            "--file",
+            "b.xsp",
+        ])
+        .expect("failed to parse download arguments");
+
+        match args.command {
+            SubCommand::Download { files, .. } => assert_eq!(files, ["a.msixvc", "b.xsp"]),
+            _ => panic!("expected the download subcommand"),
+        }
+    }
+
+    #[test]
+    fn all_files_conflicts_with_file() {
+        let Err(error) = CliArgs::try_parse_from([
+            "xodus-cli",
+            "download",
+            "PRODUCT",
+            "--all-files",
+            "--file",
+            "a.msixvc",
+        ]) else {
+            panic!("conflicting flags should be rejected");
+        };
+        assert!(error.to_string().contains("cannot be used with"), "{error}");
+    }
+
+    #[test]
+    fn streaming_parses_sub_product() {
+        let args = CliArgs::try_parse_from([
+            "xodus-cli",
+            "streaming",
+            "SRC",
+            "DEST",
+            "--sub-product",
+            "9ABCDEF12345",
+        ])
+        .expect("failed to parse streaming arguments");
+
+        match args.command {
+            SubCommand::Streaming { sub_product, .. } => {
+                assert_eq!(sub_product.as_deref(), Some("9ABCDEF12345"));
+            }
+            _ => panic!("expected the streaming subcommand"),
+        }
+    }
+
+    #[test]
+    fn non_interactive_is_global_and_defaults_to_false() {
+        let default = CliArgs::try_parse_from(["xodus-cli", "download", "PRODUCT"])
+            .expect("failed to parse download arguments");
+        assert!(!default.non_interactive);
+
+        for argv in [
+            &["xodus-cli", "--non-interactive", "download", "PRODUCT"][..],
+            &["xodus-cli", "download", "PRODUCT", "--non-interactive"][..],
+        ] {
+            let args = CliArgs::try_parse_from(argv).expect("failed to parse non-interactive flag");
+            assert!(args.non_interactive);
+        }
+    }
+
+    #[test]
+    fn non_interactive_env_value_accepts_only_truthy_values() {
+        for value in [Some("1"), Some("true"), Some("YES"), Some("on")] {
+            assert!(env_flag_value(value), "{value:?} should enable it");
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ] {
+            assert!(!env_flag_value(value), "{value:?} should not enable it");
         }
     }
 }
