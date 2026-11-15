@@ -128,21 +128,32 @@ async fn with_cleanup_error(device: &str, mount_dir: Option<&str>, error: String
     }
 }
 
+/// RAM disk size in 512-byte sectors: twice the encrypted files, never below 4 MB
+/// (newfs_hfs refuses volumes under 512 KB; STEEP's 48 KB starter exe failed).
+#[cfg(target_os = "macos")]
+fn ram_disk_sectors(encrypted_lengths: impl Iterator<Item = u64>) -> u64 {
+    const MINIMUM_SECTORS: u64 = 4 * 1024 * 1024 / 512;
+    let disk_size: u64 = encrypted_lengths
+        .map(|length| length + 4 * PAGE_SIZE as u64)
+        .sum();
+    disk_size.div_ceil(256).max(MINIMUM_SECTORS)
+}
+
 #[cfg(target_os = "macos")]
 async fn prepare(
     lfiles: &HashMap<String, SegmentFile>,
 ) -> Result<(impl AsyncFnOnce() -> Result<(), String>, String), String> {
-    let disk_size: u64 = lfiles
-        .iter()
-        .filter(|f| f.1.keep_encrypted)
-        .map(|f| f.1.length + 4 * PAGE_SIZE as u64)
-        .reduce(|o, s| o + s)
-        .ok_or_else(|| "no encrypted files to place on the RAM disk".to_string())?;
+    let sectors = ram_disk_sectors(
+        lfiles
+            .values()
+            .filter(|file| file.keep_encrypted)
+            .map(|file| file.length),
+    );
 
     let output = Command::new("/usr/bin/hdiutil")
         .arg("attach")
         .arg("-nomount")
-        .arg(format!("ram://{}", disk_size.div_ceil(256)))
+        .arg(format!("ram://{sectors}"))
         .output()
         .await
         .map_err(|err| format!("Failed to run hdiutil attach: {err}"))?;
@@ -539,6 +550,26 @@ mod tests {
     fn shutdown_signals_map_to_shell_exit_codes() {
         assert_eq!(ShutdownSignal::Interrupt.exit_code(), 130);
         assert_eq!(ShutdownSignal::Terminate.exit_code(), 143);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ram_disk_sectors_uses_minimum_and_doubles_data() {
+        const MINIMUM_SECTORS: u64 = 4 * 1024 * 1024 / 512;
+
+        assert_eq!(super::ram_disk_sectors(std::iter::empty()), MINIMUM_SECTORS);
+        assert_eq!(
+            super::ram_disk_sectors([100 * 1024u64].into_iter()),
+            MINIMUM_SECTORS
+        );
+
+        let large = 184_143_872u64;
+        let sectors = super::ram_disk_sectors([large].into_iter());
+        assert_eq!(
+            sectors,
+            (large + 4 * msixvc::layout::PAGE_SIZE as u64).div_ceil(256)
+        );
+        assert!(sectors * 512 >= 2 * large);
     }
 
     #[test]
