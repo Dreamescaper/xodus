@@ -79,6 +79,9 @@ enum SubCommand {
         exe: Option<String>,
         #[arg(short, long)]
         market: Option<String>,
+        /// Arguments for the game, after --
+        #[arg(last = true)]
+        game_args: Vec<String>,
     },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
@@ -232,7 +235,8 @@ async fn main() -> ExitCode {
             wine,
             exe,
             market,
-        } => commands::run::run(&client, &tokens, source, wine, exe, market).await,
+            game_args,
+        } => commands::run::run(&client, &tokens, source, wine, exe, market, game_args).await,
         SubCommand::Clep { action } => match action {
             ClepAction::Generate {
                 smbios,
@@ -246,4 +250,45 @@ async fn main() -> ExitCode {
     xodus::secrets::destroy_secrets();
 
     code
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{CliArgs, SubCommand};
+    use clap::Parser;
+
+    #[test]
+    fn run_parses_game_args_after_double_dash() {
+        let args = CliArgs::try_parse_from([
+            "xodus-cli",
+            "run",
+            "SRC",
+            "WINE",
+            "--exe",
+            "a.exe",
+            "--",
+            "-window-mode",
+            "borderless",
+        ])
+        .expect("failed to parse run arguments");
+
+        match args.command {
+            SubCommand::Run { exe, game_args, .. } => {
+                assert_eq!(exe.as_deref(), Some("a.exe"));
+                assert_eq!(game_args, ["-window-mode", "borderless"]);
+            }
+            _ => panic!("expected the run subcommand"),
+        }
+    }
+
+    #[test]
+    fn run_without_double_dash_has_no_game_args() {
+        let args = CliArgs::try_parse_from(["xodus-cli", "run", "SRC", "WINE"])
+            .expect("failed to parse run arguments");
+
+        match args.command {
+            SubCommand::Run { game_args, .. } => assert!(game_args.is_empty()),
+            _ => panic!("expected the run subcommand"),
+        }
+    }
 }

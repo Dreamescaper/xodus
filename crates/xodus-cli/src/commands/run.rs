@@ -265,6 +265,7 @@ pub async fn run(
     wine: String,
     exe: Option<String>,
     market: Option<String>,
+    game_args: Vec<String>,
 ) -> ExitCode {
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
@@ -468,6 +469,7 @@ pub async fn run(
 
         let mut wn = Command::new(wine)
             .arg(nt_entry)
+            .args(game_args)
             .env("WINE_DLL_FILE_MAP", env_value)
             .spawn()
             .map_err(|err| format!("Failed to launch Wine: {err}"))?;
