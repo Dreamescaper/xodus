@@ -1088,6 +1088,8 @@ impl XvdFile {
                                 }
                             }
                         }
+                        // A resume starts a fresh failure budget.
+                        reconnect_attempts = 0;
                         stream = open_segment_stream(
                             client,
                             &urls[url_index],
@@ -1178,7 +1180,31 @@ impl XvdFile {
                     }
                     let backoff = reconnect_backoff(reconnect_attempts);
                     reconnect_attempts += 1;
-                    sleep(backoff).await;
+                    let mut control_lost = false;
+                    let mut control_changed = false;
+                    if let Some(receiver) = control.as_mut() {
+                        tokio::select! {
+                            biased;
+                            changed = receiver.changed() => {
+                                if changed.is_err() {
+                                    control_lost = true;
+                                }
+                                control_changed = true;
+                            }
+                            _ = sleep(backoff) => {}
+                        }
+                    } else {
+                        sleep(backoff).await;
+                    }
+                    if control_lost {
+                        control = None;
+                    }
+                    if control_changed {
+                        // Let the top of the loop park on pause or return on
+                        // stop; a resume reconnects with a fresh budget.
+                        drop(stream.take());
+                        continue;
+                    }
                     stream = open_segment_stream(
                         client,
                         &urls[url_index],

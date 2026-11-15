@@ -22,7 +22,7 @@ const MAX_CONTROL_BYTES: usize = 256;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Exit status used when the launcher sends `{"command":"stop"}`.
-pub(super) const STOP_EXIT_CODE: i32 = 129;
+pub(super) const STOP_EXIT_CODE: i32 = 3;
 
 /// How a failure should be reported to a JSON consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,16 @@ impl FailureKind {
             Self::Stopped => "stopped",
         }
     }
+
+    /// Fixed, path/URL-free text for launcher-facing error events.
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::Auth => "authentication or licensing failed",
+            Self::Network => "a network request failed",
+            Self::Other => "streaming failed",
+            Self::Stopped => "streaming stopped",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -51,10 +61,12 @@ pub(super) struct StreamingFailure {
 }
 
 impl StreamingFailure {
+    /// `message` must be a fixed, path/URL-free string. Detailed errors stay on
+    /// stderr and are never copied into launcher-facing events.
     pub(super) fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
-            message: sanitize_message(&message.into()),
+            message: message.into(),
         }
     }
 
@@ -76,7 +88,7 @@ impl StreamingFailure {
             CommandError::Network { .. } => FailureKind::Network,
             CommandError::Other { .. } => FailureKind::Other,
         };
-        Self::new(kind, error.to_string())
+        Self::new(kind, kind.message())
     }
 }
 
@@ -121,6 +133,31 @@ pub(super) fn parse_control(bytes: &[u8]) -> Option<ControlCommand> {
     }
 }
 
+/// Atomically transition the control watch channel. `Stop` is terminal: once
+/// set, pause/resume/EOF can never overwrite it. Returns true only when the
+/// state actually changed. The exit code is stored under the same lock so a
+/// woken transfer cannot observe Stop without its code.
+pub(super) fn set_control(
+    tx: &watch::Sender<TransferControl>,
+    next: TransferControl,
+    exit: &AtomicI32,
+    code: i32,
+) -> bool {
+    let mut changed = false;
+    tx.send_if_modified(|state| {
+        if *state == TransferControl::Stop || *state == next {
+            return false;
+        }
+        *state = next;
+        if next == TransferControl::Stop {
+            exit.store(code, Ordering::SeqCst);
+        }
+        changed = true;
+        true
+    });
+    changed
+}
+
 /// Read control lines from stdin on a plain thread and turn them into a watch
 /// value and progress events. Returns the sender used by signal handling too.
 pub(super) fn controls(
@@ -142,7 +179,6 @@ pub(super) fn controls(
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
         let mut bytes = Vec::new();
-        let mut state = TransferControl::Running;
         loop {
             bytes.clear();
             // Bound control records; discard overlong lines without parsing.
@@ -162,46 +198,33 @@ pub(super) fn controls(
             }
             match parse_control(&bytes) {
                 Some(ControlCommand::Pause) => {
-                    if state == TransferControl::Paused {
-                        continue;
-                    }
-                    state = TransferControl::Paused;
-                    if tx.send(state).is_err() {
-                        return;
-                    }
-                    if events
-                        .blocking_send(ProgressEvent::Paused { paused: true })
-                        .is_err()
+                    if set_control(&tx, TransferControl::Paused, &exit, 0)
+                        && events
+                            .blocking_send(ProgressEvent::Paused { paused: true })
+                            .is_err()
                     {
                         return;
                     }
                 }
                 Some(ControlCommand::Resume) => {
-                    if state != TransferControl::Paused {
-                        continue;
-                    }
-                    state = TransferControl::Running;
-                    if tx.send(state).is_err() {
-                        return;
-                    }
-                    if events
-                        .blocking_send(ProgressEvent::Paused { paused: false })
-                        .is_err()
+                    if set_control(&tx, TransferControl::Running, &exit, 0)
+                        && events
+                            .blocking_send(ProgressEvent::Paused { paused: false })
+                            .is_err()
                     {
                         return;
                     }
                 }
                 Some(ControlCommand::Stop) => {
-                    exit.store(STOP_EXIT_CODE, Ordering::Relaxed);
-                    tx.send(TransferControl::Stop).ok();
+                    set_control(&tx, TransferControl::Stop, &exit, STOP_EXIT_CODE);
                     return;
                 }
                 None => {}
             }
         }
         // Losing the controller must never leave a live download parked paused.
-        if release_on_eof(&mut state) {
-            tx.send(TransferControl::Running).ok();
+        // A stop, however, is terminal and is never released by EOF.
+        if release_on_eof(&tx, &exit) {
             events
                 .blocking_send(ProgressEvent::Paused { paused: false })
                 .ok();
@@ -210,14 +233,10 @@ pub(super) fn controls(
     (Some(signal_tx), rx)
 }
 
-/// Apply the stdin-EOF guard: a paused transfer becomes runnable again.
-pub(super) fn release_on_eof(state: &mut TransferControl) -> bool {
-    if *state == TransferControl::Paused {
-        *state = TransferControl::Running;
-        true
-    } else {
-        false
-    }
+/// Apply the stdin-EOF guard: a paused transfer becomes runnable again unless
+/// a terminal Stop has already won.
+pub(super) fn release_on_eof(tx: &watch::Sender<TransferControl>, exit: &AtomicI32) -> bool {
+    set_control(tx, TransferControl::Running, exit, 0)
 }
 
 #[cfg(unix)]
@@ -237,8 +256,8 @@ pub(super) fn install_signal_handlers(
             _ = interrupt.recv() => 130,
             _ = terminate.recv() => 143,
         };
-        exit.store(code, Ordering::Relaxed);
-        sender.send(TransferControl::Stop).ok();
+        // The first stop wins; a later signal never rewrites the exit code.
+        set_control(&sender, TransferControl::Stop, &exit, code);
     });
 }
 
@@ -249,8 +268,7 @@ pub(super) fn install_signal_handlers(
 ) {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            exit.store(130, Ordering::Relaxed);
-            sender.send(TransferControl::Stop).ok();
+            set_control(&sender, TransferControl::Stop, &exit, 130);
         }
     });
 }
@@ -348,7 +366,6 @@ fn phase_for(name: &str) -> &'static str {
         "Licensing" => "licensing",
         "Downloading" => "downloading",
         "Finalizing" => "finalizing",
-        "Done" => "done",
         _ => "metadata",
     }
 }
@@ -366,9 +383,6 @@ fn record(state: &State, sequence: u64, event: &str, rate: u64) -> serde_json::V
         "filesDone": state.files_done,
         "filesTotal": state.files_total,
         "bytesPerSecond": rate,
-        // Nexus-compatible aliases for consumers written against its protocol.
-        "completedBytes": state.bytes_done,
-        "totalBytes": state.bytes_total,
     })
 }
 
@@ -382,29 +396,56 @@ fn error_record(sequence: u64, kind: FailureKind, message: &str) -> serde_json::
         "event": "error",
         "sequence": sequence,
         "kind": kind.as_str(),
-        "message": sanitize_message(message),
+        "message": message,
     })
 }
 
-fn emit(value: &serde_json::Value) {
+fn emit_stdout(value: &serde_json::Value) -> bool {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "{value}").ok();
-    out.flush().ok();
+    writeln!(out, "{value}").is_ok() && out.flush().is_ok()
+}
+
+fn output_failed(control: &Option<watch::Sender<TransferControl>>, exit: &AtomicI32) {
+    if let Some(sender) = control {
+        // A dead consumer is equivalent to a stop: checkpoint and exit 3.
+        set_control(sender, TransferControl::Stop, exit, STOP_EXIT_CODE);
+    }
 }
 
 /// Emit a terminal error without starting the progress reporter. Used for
 /// failures that happen before a reader exists (product lookup, source open).
 pub(super) fn emit_error(kind: FailureKind, message: &str) {
-    emit(&error_record(0, kind, message));
+    emit_stdout(&error_record(0, kind, message));
 }
 
-pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>) {
+/// Emit a terminal stopped line when a stop happens before the reporter starts.
+pub(super) fn emit_stopped() {
+    emit_stdout(&record(&State::default(), 0, "stopped", 0));
+}
+
+pub(super) async fn report(
+    events: mpsc::Receiver<ProgressEvent>,
+    control: Option<watch::Sender<TransferControl>>,
+    exit: Arc<AtomicI32>,
+) {
+    report_with(events, control, exit, emit_stdout).await;
+}
+
+pub(super) async fn report_with(
+    mut events: mpsc::Receiver<ProgressEvent>,
+    control: Option<watch::Sender<TransferControl>>,
+    exit: Arc<AtomicI32>,
+    mut emit: impl FnMut(&serde_json::Value) -> bool,
+) {
     let mut state = State::default();
     let mut sequence = 0u64;
     let mut throttle = Throttle::new(PROGRESS_INTERVAL);
     let mut rate = Rate::new(0);
-    emit(&record(&state, sequence, "progress", 0));
+    if !emit(&record(&state, sequence, "progress", 0)) {
+        output_failed(&control, &exit);
+        return;
+    }
     while let Some(event) = events.recv().await {
         let now = Instant::now();
         let mut force = false;
@@ -451,128 +492,50 @@ pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>) {
             ProgressEvent::Paused { paused } => {
                 state.paused = paused;
                 throttle.ready(true);
+                rate.reset(state.bytes_done, now);
                 sequence += 1;
-                let rate = rate.update(state.bytes_done, paused, now);
-                emit(&record(
+                if !emit(&record(
                     &state,
                     sequence,
                     if paused { "paused" } else { "resumed" },
-                    rate,
-                ));
+                    0,
+                )) {
+                    output_failed(&control, &exit);
+                    return;
+                }
                 continue;
             }
             ProgressEvent::Completed => {
                 sequence += 1;
-                emit(&done_record(sequence));
+                if !emit(&done_record(sequence)) {
+                    output_failed(&control, &exit);
+                }
                 break;
             }
             ProgressEvent::Failed { kind, message } => {
                 sequence += 1;
-                emit(&error_record(sequence, kind, &message));
+                if !emit(&error_record(sequence, kind, &message)) {
+                    output_failed(&control, &exit);
+                }
                 break;
             }
             ProgressEvent::Stopped => {
                 sequence += 1;
-                emit(&record(&state, sequence, "stopped", 0));
+                if !emit(&record(&state, sequence, "stopped", 0)) {
+                    output_failed(&control, &exit);
+                }
                 break;
             }
         }
         if throttle.ready(force) {
             let rate = rate.update(state.bytes_done, state.paused, now);
             sequence += 1;
-            emit(&record(&state, sequence, "progress", rate));
+            if !emit(&record(&state, sequence, "progress", rate)) {
+                output_failed(&control, &exit);
+                return;
+            }
         }
     }
-}
-
-/// Remove paths, URLs, and long numeric identifiers from an error message.
-///
-/// Messages are still useful, but a launcher-facing event must not disclose
-/// local paths, CDN URLs, query tokens, or account ids.
-pub(super) fn sanitize_message(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    let mut boundary = true;
-    while let Some(ch) = rest.chars().next() {
-        let url = boundary
-            && (rest.starts_with("http://")
-                || rest.starts_with("https://")
-                || rest.starts_with("file://"));
-        if url {
-            out.push_str("<url>");
-            rest = skip_value(rest);
-            boundary = false;
-            continue;
-        }
-        if boundary && is_windows_path(rest) {
-            out.push_str("<path>");
-            rest = skip_value(rest);
-            boundary = false;
-            continue;
-        }
-        if boundary && rest.starts_with('/') {
-            out.push_str("<path>");
-            rest = skip_value(rest);
-            boundary = false;
-            continue;
-        }
-        if boundary && starts_long_digits(rest) {
-            out.push_str("<id>");
-            rest = skip_digits(rest);
-            boundary = false;
-            continue;
-        }
-        out.push(ch);
-        rest = &rest[ch.len_utf8()..];
-        boundary = ch.is_whitespace()
-            || matches!(
-                ch,
-                '(' | '[' | '{' | '"' | '\'' | '`' | '=' | ',' | ';' | ':'
-            );
-    }
-    out
-}
-
-fn is_windows_path(rest: &str) -> bool {
-    let bytes = rest.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-}
-
-fn starts_long_digits(rest: &str) -> bool {
-    rest.as_bytes()
-        .iter()
-        .take_while(|b| b.is_ascii_digit())
-        .count()
-        >= 10
-}
-
-fn skip_digits(rest: &str) -> &str {
-    let len = rest
-        .as_bytes()
-        .iter()
-        .take_while(|b| b.is_ascii_digit())
-        .count();
-    &rest[len..]
-}
-
-fn skip_value(rest: &str) -> &str {
-    let mut end = 0;
-    for (index, ch) in rest.char_indices() {
-        if ch.is_whitespace()
-            || matches!(
-                ch,
-                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
-            )
-        {
-            end = index;
-            break;
-        }
-        end = index + ch.len_utf8();
-    }
-    &rest[end..]
 }
 
 #[cfg(test)]
@@ -599,40 +562,33 @@ mod tests {
         assert_eq!(value["filesDone"], 1);
         assert_eq!(value["filesTotal"], 2);
         assert_eq!(value["bytesPerSecond"], 2048);
-        assert_eq!(value["completedBytes"], 512);
-        assert_eq!(value["totalBytes"], 1024);
         assert_eq!(value["canPause"], true);
+        assert!(value.get("completedBytes").is_none());
+        assert!(value.get("totalBytes").is_none());
     }
 
     #[test]
-    fn error_records_are_schema_versioned_and_never_leak_paths_urls_or_ids() {
-        let value = error_record(
-            3,
-            FailureKind::Network,
-            "could not open /tmp/highball/game.msixvc from \
-             https://user:secret@cdn.example/game?token=abc for account 2533274790395904",
-        );
+    fn error_records_are_schema_versioned_and_use_fixed_kind_messages() {
+        let value = error_record(3, FailureKind::Network, FailureKind::Network.message());
         let text = value.to_string();
         assert_eq!(value["schema"], 1);
         assert_eq!(value["event"], "error");
         assert_eq!(value["kind"], "network");
-        assert!(!text.contains("/tmp/highball"), "{text}");
+        assert!(!text.contains("/tmp"), "{text}");
         assert!(!text.contains("https://"), "{text}");
-        assert!(!text.contains("secret"), "{text}");
-        assert!(!text.contains("token=abc"), "{text}");
-        assert!(!text.contains("2533274790395904"), "{text}");
-        assert!(text.contains("<path>"), "{text}");
-        assert!(text.contains("<url>"), "{text}");
-        assert!(text.contains("<id>"), "{text}");
     }
 
     #[test]
-    fn windows_paths_and_account_ids_are_redacted() {
-        let text = sanitize_message("could not read C:\\Games\\data.bin for 1234567890123456");
-        assert!(!text.contains("C:\\Games"), "{text}");
-        assert!(!text.contains("1234567890123456"), "{text}");
-        assert!(text.contains("<path>"), "{text}");
-        assert!(text.contains("<id>"), "{text}");
+    fn command_failures_discard_free_text_for_a_fixed_kind_message() {
+        let error = CommandError::network_from(
+            "could not fetch https://user:pass@host/x?token=abc /tmp/game.msixvc",
+            std::io::Error::other("detail"),
+        );
+        let failure = StreamingFailure::from_command(error);
+        assert_eq!(failure.kind, FailureKind::Network);
+        assert_eq!(failure.message, FailureKind::Network.message());
+        assert!(!failure.message.contains("http"), "{failure:?}");
+        assert!(!failure.message.contains("/tmp"), "{failure:?}");
     }
 
     #[test]
@@ -676,17 +632,51 @@ mod tests {
 
     #[test]
     fn stdin_eof_releases_only_a_paused_transfer() {
-        let mut paused = TransferControl::Paused;
-        assert!(release_on_eof(&mut paused));
-        assert_eq!(paused, TransferControl::Running);
+        let (tx, rx) = watch::channel(TransferControl::Paused);
+        let exit = AtomicI32::new(0);
+        assert!(release_on_eof(&tx, &exit));
+        assert_eq!(*rx.borrow(), TransferControl::Running);
 
-        let mut running = TransferControl::Running;
-        assert!(!release_on_eof(&mut running));
-        assert_eq!(running, TransferControl::Running);
+        let (tx, rx) = watch::channel(TransferControl::Running);
+        assert!(!release_on_eof(&tx, &exit));
+        assert_eq!(*rx.borrow(), TransferControl::Running);
+    }
 
-        let mut stopped = TransferControl::Stop;
-        assert!(!release_on_eof(&mut stopped));
-        assert_eq!(stopped, TransferControl::Stop);
+    #[test]
+    fn stop_is_terminal_across_eof_and_late_control_commands() {
+        let (tx, rx) = watch::channel(TransferControl::Running);
+        let exit = AtomicI32::new(0);
+        assert!(set_control(&tx, TransferControl::Paused, &exit, 0));
+        assert!(set_control(
+            &tx,
+            TransferControl::Stop,
+            &exit,
+            STOP_EXIT_CODE
+        ));
+        assert_eq!(exit.load(Ordering::SeqCst), STOP_EXIT_CODE);
+        assert_eq!(STOP_EXIT_CODE, 3);
+
+        // stdin EOF and late commands must not overwrite a terminal stop.
+        assert!(!release_on_eof(&tx, &exit));
+        assert!(!set_control(&tx, TransferControl::Paused, &exit, 0));
+        assert!(!set_control(&tx, TransferControl::Running, &exit, 0));
+        assert!(!set_control(&tx, TransferControl::Stop, &exit, 143));
+        assert_eq!(*rx.borrow(), TransferControl::Stop);
+        assert_eq!(
+            exit.load(Ordering::SeqCst),
+            STOP_EXIT_CODE,
+            "a later signal must not rewrite the first stop code"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_stdout_stops_the_transfer_with_code_three() {
+        let (_tx, rx) = mpsc::channel(4);
+        let (control_tx, control_rx) = watch::channel(TransferControl::Running);
+        let exit = Arc::new(AtomicI32::new(0));
+        report_with(rx, Some(control_tx), exit.clone(), |_| false).await;
+        assert_eq!(*control_rx.borrow(), TransferControl::Stop);
+        assert_eq!(exit.load(Ordering::SeqCst), STOP_EXIT_CODE);
     }
 
     #[test]
@@ -743,9 +733,11 @@ mod tests {
     }
 
     #[test]
-    fn failure_messages_are_sanitized_at_construction() {
-        let failure = StreamingFailure::network("failed for file:///Users/me/game.msixvc");
-        assert!(!failure.message.contains("/Users/me"), "{failure:?}");
-        assert!(failure.message.contains("<url>"), "{failure:?}");
+    fn default_messages_are_fixed_and_path_free() {
+        for kind in [FailureKind::Auth, FailureKind::Network, FailureKind::Other] {
+            let text = format!("{} {}", kind.as_str(), kind.message());
+            assert!(!text.contains('/'), "{text}");
+            assert!(!text.contains("://"), "{text}");
+        }
     }
 }

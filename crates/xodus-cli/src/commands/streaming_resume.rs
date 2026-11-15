@@ -257,7 +257,7 @@ fn tail(path: &Path, offset: u64) -> io::Result<String> {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use msixvc::streaming::TransferControl;
@@ -883,6 +883,127 @@ mod tests {
                 .offset("segment.bin", content.length),
             content.length
         );
+    }
+
+    #[tokio::test]
+    async fn json_reporter_from_a_loopback_transfer_only_emits_schema_one_events() {
+        use super::super::ProgressEvent;
+        use super::super::progress;
+        use tokio::sync::{mpsc, watch};
+
+        let body: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("segment.bin");
+        let files = HashMap::from([(
+            "segment.bin".to_owned(),
+            SegmentFile {
+                offset: 0,
+                length: body.len() as u64,
+                keep_encrypted: false,
+                data_hashs: vec![],
+            },
+        )]);
+        let content = &files["segment.bin"];
+        let xvd = synthetic_xvd().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let server =
+            spawn_throttled_server(body.clone(), 4096, std::time::Duration::from_millis(1)).await;
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (control_tx, _control_rx) = watch::channel(TransferControl::Running);
+        let exit = Arc::new(AtomicI32::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let reporter = tokio::spawn(async move {
+            progress::report_with(events_rx, Some(control_tx), exit, move |value| {
+                sink.lock().unwrap().push(value.to_string());
+                true
+            })
+            .await;
+        });
+
+        events_tx
+            .send(ProgressEvent::Planned {
+                total: body.len() as u64,
+                saved: 0,
+                files: 1,
+            })
+            .await
+            .unwrap();
+        events_tx
+            .send(ProgressEvent::UpdateRemaining {
+                name: "Downloading".to_owned(),
+                total: body.len() as u64,
+            })
+            .await
+            .unwrap();
+        events_tx
+            .send(ProgressEvent::Started {
+                id: 0,
+                name: "segment".to_owned(),
+                total: body.len() as u64,
+            })
+            .await
+            .unwrap();
+        let mut output = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let mut sent = 0u64;
+        let progress_tx = events_tx.clone();
+        xvd.download_file_http(
+            &client,
+            std::slice::from_ref(&server.url),
+            &mut output,
+            content,
+            [0; 32],
+            move |pos, _| {
+                let delta = pos - sent;
+                sent = pos;
+                progress_tx
+                    .try_send(ProgressEvent::Advanced { id: 0, delta })
+                    .ok();
+            },
+            None,
+            0,
+            |_| tokio::task::spawn_blocking(|| Ok(())),
+            Arc::new(AtomicUsize::new(0)),
+            body.len() as u64,
+        )
+        .await
+        .unwrap();
+        output.flush().await.unwrap();
+        events_tx
+            .send(ProgressEvent::Finished { id: 0 })
+            .await
+            .unwrap();
+        events_tx.send(ProgressEvent::Completed).await.unwrap();
+        drop(events_tx);
+        reporter.await.unwrap();
+
+        let lines = captured.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("\"event\":\"progress\""))
+        );
+        assert!(lines.iter().any(|line| line.contains("\"event\":\"done\"")));
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(&line).expect("stdout is JSON");
+            assert_eq!(value["schema"], 1, "{line}");
+            let event = value["event"].as_str().expect("event name");
+            assert!(
+                matches!(
+                    event,
+                    "progress" | "paused" | "resumed" | "stopped" | "done" | "error"
+                ),
+                "{line}"
+            );
+            assert!(!line.contains(&path.display().to_string()), "{line}");
+            assert!(!line.contains("http://"), "{line}");
+        }
     }
 
     async fn synthetic_xvd() -> msixvc::xvd::XvdFile {

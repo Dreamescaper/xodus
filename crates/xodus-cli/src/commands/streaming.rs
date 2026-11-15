@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -141,7 +142,52 @@ fn report_failure(progress_json: bool, kind: progress::FailureKind, message: &st
 
 fn report_error(progress_json: bool, error: &(dyn std::error::Error + 'static)) {
     if progress_json {
-        progress::emit_error(progress::classify_failure(error), &error.to_string());
+        let kind = progress::classify_failure(error);
+        progress::emit_error(kind, kind.message());
+    }
+}
+
+fn stopped_exit(progress_json: bool, exit_code: &AtomicI32) -> ExitCode {
+    if progress_json {
+        progress::emit_stopped();
+    }
+    let code = exit_code.load(Ordering::SeqCst);
+    let code = if code == 0 {
+        progress::STOP_EXIT_CODE
+    } else {
+        code
+    };
+    ExitCode::from(code as u8)
+}
+
+/// Run a pre-download phase until it finishes or a terminal Stop is requested.
+/// Stop/SIGINT/SIGTERM are therefore not swallowed by metadata or licensing.
+async fn until_stopped<F, T>(
+    control: &Option<watch::Receiver<TransferControl>>,
+    future: F,
+) -> Result<T, progress::StreamingFailure>
+where
+    F: Future<Output = T>,
+{
+    let Some(mut receiver) = control.as_ref().cloned() else {
+        return Ok(future.await);
+    };
+    if *receiver.borrow() == TransferControl::Stop {
+        return Err(progress::StreamingFailure::stopped());
+    }
+    tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if *receiver.borrow() == TransferControl::Stop {
+                    break;
+                }
+                if receiver.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => Err(progress::StreamingFailure::stopped()),
+        value = future => Ok(value),
     }
 }
 
@@ -156,15 +202,24 @@ pub async fn run(
         try_skip_ntfs,
         parallel,
         market,
-        selection,
+        mut selection,
         progress: progress_mode,
     } = options;
     let progress_json = progress_mode == ProgressMode::Json;
+    if progress_json {
+        // A JSON consumer cannot answer an interactive prompt either.
+        selection.non_interactive = true;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
     let exit_code = Arc::new(AtomicI32::new(0));
     let (control_sender, control) =
         progress::controls(progress_json, tx.clone(), exit_code.clone());
     let control = if progress_json { Some(control) } else { None };
+    let report_control = if progress_json {
+        control_sender.clone()
+    } else {
+        None
+    };
     if let Some(sender) = control_sender {
         progress::install_signal_handlers(sender, exit_code.clone());
     }
@@ -213,6 +268,7 @@ pub async fn run(
             rx,
             progress_json,
             control,
+            report_control,
             exit_code,
         )
         .await
@@ -221,8 +277,15 @@ pub async fn run(
             vec![source]
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
-                let content_id_task =
-                    get_content_id(client, source, market.clone(), &selection).await;
+                let content_id_task = until_stopped(
+                    &control,
+                    get_content_id(client, source, market.clone(), &selection),
+                )
+                .await;
+                let content_id_task = match content_id_task {
+                    Err(_) => return stopped_exit(progress_json, &exit_code),
+                    Ok(task) => task,
+                };
                 let Ok(content_id) = content_id_task else {
                     let Err(err) = content_id_task else {
                         eprintln!("Unknown Error");
@@ -241,7 +304,12 @@ pub async fn run(
             } else {
                 source
             };
-            let package_result = get_packages(client, tokens, content_id.clone()).await;
+            let package_result =
+                until_stopped(&control, get_packages(client, tokens, content_id.clone())).await;
+            let package_result = match package_result {
+                Err(_) => return stopped_exit(progress_json, &exit_code),
+                Ok(task) => task,
+            };
             let Ok(package) = package_result else {
                 let Err(err) = package_result else {
                     eprintln!("Unknown Error");
@@ -250,7 +318,8 @@ pub async fn run(
                 };
                 eprintln!("{}", err);
                 if progress_json {
-                    progress::emit_error(progress::classify_failure(&err), &err.to_string());
+                    let kind = progress::classify_failure(&err);
+                    progress::emit_error(kind, kind.message());
                 }
                 return ExitCode::FAILURE;
             };
@@ -290,7 +359,7 @@ pub async fn run(
         };
         let mut pos = 0;
         let progress_tx = tx.clone();
-        let http_file = match streaming::HttpRead::open_urls(
+        let open = streaming::HttpRead::open_urls(
             client.clone(),
             urls.clone(),
             Some(move |c, _| {
@@ -304,11 +373,11 @@ pub async fn run(
                     pos = c;
                 }
             }),
-        )
-        .await
-        {
-            Ok(file) => file,
-            Err(err) => {
+        );
+        let http_file = match until_stopped(&control, open).await {
+            Err(_) => return stopped_exit(progress_json, &exit_code),
+            Ok(Ok(file)) => file,
+            Ok(Err(err)) => {
                 eprintln!(
                     "could not open streaming source {}: {}",
                     source_label(first_url),
@@ -341,6 +410,7 @@ pub async fn run(
             rx,
             progress_json,
             control,
+            report_control,
             exit_code,
         )
         .await
@@ -364,14 +434,16 @@ async fn run_cli_reader<Reader>(
     mut rx: Receiver<ProgressEvent>,
     progress_json: bool,
     control: Option<watch::Receiver<TransferControl>>,
+    report_control: Option<watch::Sender<TransferControl>>,
     exit_code: Arc<AtomicI32>,
 ) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
+    let reporter_exit = exit_code.clone();
     let reporter = tokio::spawn(async move {
         if progress_json {
-            progress::report(rx).await;
+            progress::report(rx, report_control, reporter_exit).await;
             return;
         }
         let multi_progress = MultiProgress::new();
@@ -510,10 +582,15 @@ where
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
 
-    let mut remote_file = match streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await
+    let mut remote_file = match until_stopped(
+        &control,
+        streaming::PrefixCacheFile::new(reader, l, cache_path.clone()),
+    )
+    .await
     {
-        Ok(file) => file,
-        Err(err) => {
+        Err(failure) => return Err(failure),
+        Ok(Ok(file)) => file,
+        Ok(Err(err)) => {
             eprintln!(
                 "could not create streaming cache {}: {err}",
                 cache_path.display()
@@ -523,9 +600,10 @@ where
             ));
         }
     };
-    let remote_xvd = match XvdFile::parse(&mut remote_file).await {
-        Ok(xvd) => xvd,
-        Err(error) => {
+    let remote_xvd = match until_stopped(&control, XvdFile::parse(&mut remote_file)).await {
+        Err(failure) => return Err(failure),
+        Ok(Ok(xvd)) => xvd,
+        Ok(Err(error)) => {
             eprintln!(
                 "could not parse streaming package from {}: {error}",
                 source_label(source_url)
@@ -538,9 +616,15 @@ where
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
-    let files = match remote_xvd.parse_user_package_files(&mut remote_file).await {
-        Ok(files) => files,
-        Err(error) => {
+    let files = match until_stopped(
+        &control,
+        remote_xvd.parse_user_package_files(&mut remote_file),
+    )
+    .await
+    {
+        Err(failure) => return Err(failure),
+        Ok(Ok(files)) => files,
+        Ok(Err(error)) => {
             eprintln!(
                 "could not read the package file list from {}: {error}",
                 source_label(source_url)
@@ -552,9 +636,15 @@ where
     };
     for (k, v) in &files {
         if k == "SegmentMetadata.bin" {
-            let sfiles = match remote_xvd.parse_segment_metadata(&mut remote_file, v).await {
-                Ok(files) => files,
-                Err(error) => {
+            let sfiles = match until_stopped(
+                &control,
+                remote_xvd.parse_segment_metadata(&mut remote_file, v),
+            )
+            .await
+            {
+                Err(failure) => return Err(failure),
+                Ok(Ok(files)) => files,
+                Ok(Err(error)) => {
                     eprintln!(
                         "could not read {k} from {}: {error}",
                         source_label(source_url)
@@ -574,12 +664,15 @@ where
         })
         .await
         .ok();
-        let sfiles = match remote_xvd
-            .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
-            .await
+        let sfiles = match until_stopped(
+            &control,
+            remote_xvd.parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty()),
+        )
+        .await
         {
-            Ok(files) => files,
-            Err(error) => {
+            Err(failure) => return Err(failure),
+            Ok(Ok(files)) => files,
+            Ok(Err(error)) => {
                 eprintln!(
                     "could not read NTFS metadata from {}: {error}",
                     source_label(source_url)
@@ -599,9 +692,10 @@ where
         .ok();
 
     if let Some(mut file) = file {
-        let xvd = match XvdFile::parse(&mut file).await {
-            Ok(xvd) => xvd,
-            Err(error) => {
+        let xvd = match until_stopped(&control, XvdFile::parse(&mut file)).await {
+            Err(failure) => return Err(failure),
+            Ok(Ok(xvd)) => xvd,
+            Ok(Err(error)) => {
                 eprintln!(
                     "could not parse existing package {}: {error}",
                     final_path.display()
@@ -612,9 +706,10 @@ where
             }
         };
 
-        let files = match xvd.parse_user_package_files(&mut file).await {
-            Ok(files) => files,
-            Err(error) => {
+        let files = match until_stopped(&control, xvd.parse_user_package_files(&mut file)).await {
+            Err(failure) => return Err(failure),
+            Ok(Ok(files)) => files,
+            Ok(Err(error)) => {
                 eprintln!(
                     "could not read the package file list from {}: {error}",
                     final_path.display()
@@ -626,24 +721,30 @@ where
         };
         for (k, v) in &files {
             if k == "SegmentMetadata.bin" {
-                let sfiles = match xvd.parse_segment_metadata(&mut file, v).await {
-                    Ok(files) => files,
-                    Err(error) => {
-                        eprintln!("could not read {k} from {}: {error}", final_path.display());
-                        return Err(progress::StreamingFailure::other(
-                            "could not read the existing package metadata",
-                        ));
-                    }
-                };
+                let sfiles =
+                    match until_stopped(&control, xvd.parse_segment_metadata(&mut file, v)).await {
+                        Err(failure) => return Err(failure),
+                        Ok(Ok(files)) => files,
+                        Ok(Err(error)) => {
+                            eprintln!("could not read {k} from {}: {error}", final_path.display());
+                            return Err(progress::StreamingFailure::other(
+                                "could not read the existing package metadata",
+                            ));
+                        }
+                    };
                 lfiles = sfiles;
             }
         }
 
-        if let Ok(sfiles) = xvd
-            .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
-            .await
+        match until_stopped(
+            &control,
+            xvd.parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty()),
+        )
+        .await
         {
-            lfiles.extend(sfiles);
+            Err(failure) => return Err(failure),
+            Ok(Ok(sfiles)) => lfiles.extend(sfiles),
+            Ok(Err(_)) => {}
         }
     }
 
@@ -655,16 +756,20 @@ where
     })
     .await
     .ok();
-    let license = get_license(
-        client,
-        tokens,
-        remote_xvd.content_id().to_string(),
-        market.unwrap_or("neutral".to_string()),
+    let license = until_stopped(
+        &control,
+        get_license(
+            client,
+            tokens,
+            remote_xvd.content_id().to_string(),
+            market.unwrap_or("neutral".to_string()),
+        ),
     )
     .await;
     let (key, game_splicense) = match license {
-        Ok(license) => license,
-        Err(err) => {
+        Err(failure) => return Err(failure),
+        Ok(Ok(license)) => license,
+        Ok(Err(err)) => {
             eprintln!("{err}");
             return Err(progress::StreamingFailure::from_command(err));
         }
@@ -742,20 +847,24 @@ where
         .map(|job| (job.name.clone(), job.content.length))
         .collect();
     let journal_for_offsets = journal.clone();
-    let offsets = match tokio::task::spawn_blocking(move || {
-        let journal = journal_for_offsets.lock().expect("journal lock poisoned");
-        offset_requests
-            .into_iter()
-            .map(|(name, length)| {
-                let offset = journal.offset(&name, length);
-                (name, offset)
-            })
-            .collect::<HashMap<String, u64>>()
-    })
+    let offsets = match until_stopped(
+        &control,
+        tokio::task::spawn_blocking(move || {
+            let journal = journal_for_offsets.lock().expect("journal lock poisoned");
+            offset_requests
+                .into_iter()
+                .map(|(name, length)| {
+                    let offset = journal.offset(&name, length);
+                    (name, offset)
+                })
+                .collect::<HashMap<String, u64>>()
+        }),
+    )
     .await
     {
-        Ok(offsets) => offsets,
-        Err(err) => {
+        Err(failure) => return Err(failure),
+        Ok(Ok(offsets)) => offsets,
+        Ok(Err(err)) => {
             eprintln!("could not read download checkpoints: {err}");
             return Err(progress::StreamingFailure::other(
                 "could not read download checkpoints",
@@ -897,10 +1006,12 @@ async fn checkpoint_blocking(
     })
     .await
     .map_err(|err| {
-        progress::StreamingFailure::other(format!("download checkpoint task failed: {err}"))
+        eprintln!("download checkpoint task failed: {err}");
+        progress::StreamingFailure::other("could not save a download checkpoint")
     })?
     .map_err(|err| {
-        progress::StreamingFailure::other(format!("could not save a download checkpoint: {err}"))
+        eprintln!("could not save a download checkpoint: {err}");
+        progress::StreamingFailure::other("could not save a download checkpoint")
     })
 }
 
@@ -1097,6 +1208,33 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_pre_download_phase_and_completion_is_unchanged() {
+        let (tx, rx) = watch::channel(TransferControl::Running);
+        let control = Some(rx);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tx.send(TransferControl::Stop).ok();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            until_stopped(&control, std::future::pending::<()>()),
+        )
+        .await
+        .expect("stop must cancel a slow pre-download phase");
+        assert!(result.is_err());
+        stopper.await.unwrap();
+
+        let (tx, rx) = watch::channel(TransferControl::Running);
+        let control = Some(rx);
+        assert_eq!(
+            until_stopped(&control, async { 42 }).await.unwrap(),
+            42,
+            "a running transfer returns the phase result"
+        );
+        drop(tx);
     }
 
     #[test]

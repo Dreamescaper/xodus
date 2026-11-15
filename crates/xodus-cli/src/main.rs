@@ -184,8 +184,11 @@ fn env_flag_value(value: Option<&str>) -> bool {
 #[tokio::main]
 async fn main() -> ExitCode {
     let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
-    let registry =
-        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
+    let registry = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(filter),
+    );
 
     #[cfg(feature = "tokio_console")]
     {
