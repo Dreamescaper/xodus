@@ -67,8 +67,14 @@ or EOF lines are ignored.
 
 If stdin reaches EOF while paused, the transfer is resumed automatically:
 losing the controller must never leave a download parked forever. EOF does not
-mask a dead consumer; if writing a protocol line to stdout fails, the transfer
-is treated as stopped (checkpoint and exit 3).
+mask a dead consumer; stdout write failures are classified as follows and all
+end in a checkpoint and exit 3:
+
+- `BrokenPipe`, `ConnectionReset`, `ConnectionAborted`, or `NotConnected`:
+  the consumer is gone; stop immediately.
+- `WouldBlock` or `TimedOut`: retry every 10 ms for up to about 2 seconds, then
+  stop.
+- Any other write error: stop.
 
 The control acknowledgements are ordinary protocol lines:
 

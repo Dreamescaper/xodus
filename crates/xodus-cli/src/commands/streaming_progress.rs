@@ -20,6 +20,8 @@ use tokio::sync::{mpsc, watch};
 
 const MAX_CONTROL_BYTES: usize = 256;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const OUTPUT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 
 /// Exit status used when the launcher sends `{"command":"stop"}`.
 pub(super) const STOP_EXIT_CODE: i32 = 3;
@@ -400,10 +402,59 @@ fn error_record(sequence: u64, kind: FailureKind, message: &str) -> serde_json::
     })
 }
 
+fn consumer_gone(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+fn retry_write(mut write: impl FnMut() -> std::io::Result<()>) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        match write() {
+            Ok(()) => return true,
+            Err(err) if consumer_gone(err.kind()) => return false,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if waited >= OUTPUT_RETRY_BUDGET {
+                    return false;
+                }
+                std::thread::sleep(OUTPUT_RETRY_INTERVAL);
+                waited += OUTPUT_RETRY_INTERVAL;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn emit_line(out: &mut impl Write, value: &serde_json::Value) -> bool {
+    let line = format!("{value}\n");
+    let mut offset = 0;
+    retry_write(|| {
+        while offset < line.len() {
+            match out.write(&line.as_bytes()[offset..]) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(n) => offset += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        out.flush()
+    })
+}
+
 fn emit_stdout(value: &serde_json::Value) -> bool {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "{value}").is_ok() && out.flush().is_ok()
+    emit_line(&mut out, value)
 }
 
 fn output_failed(control: &Option<watch::Sender<TransferControl>>, exit: &AtomicI32) {
@@ -730,6 +781,82 @@ mod tests {
         apply(&mut state, ProgressEvent::Finished { id: 1 });
         assert_eq!(state.bytes_done, 30);
         assert_eq!(state.files_done, 2, "files are counted at most once");
+    }
+
+    struct FlakyWriter {
+        attempts: usize,
+        fail_once: bool,
+        data: Vec<u8>,
+    }
+
+    impl std::io::Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.attempts += 1;
+            if self.fail_once {
+                self.fail_once = false;
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BrokenPipeWriter;
+
+    impl std::io::Write for BrokenPipeWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn would_block_is_retried_and_the_transfer_continues() {
+        let (tx, rx) = mpsc::channel(4);
+        let (control_tx, control_rx) = watch::channel(TransferControl::Running);
+        let exit = Arc::new(AtomicI32::new(0));
+        let mut writer = FlakyWriter {
+            attempts: 0,
+            fail_once: true,
+            data: Vec::new(),
+        };
+        tx.send(ProgressEvent::Completed).await.unwrap();
+        drop(tx);
+        report_with(rx, Some(control_tx), exit.clone(), |value| {
+            emit_line(&mut writer, value)
+        })
+        .await;
+
+        assert_eq!(*control_rx.borrow(), TransferControl::Running);
+        assert_eq!(exit.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.attempts, 3, "one retry, then two successful lines");
+        let text = String::from_utf8(writer.data).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "progress and done, each written once");
+        assert!(lines[0].contains("\"event\":\"progress\""));
+        assert!(lines[1].contains("\"event\":\"done\""));
+    }
+
+    #[tokio::test]
+    async fn broken_pipe_stops_the_transfer_with_code_three() {
+        let (_tx, rx) = mpsc::channel(4);
+        let (control_tx, control_rx) = watch::channel(TransferControl::Running);
+        let exit = Arc::new(AtomicI32::new(0));
+        let mut writer = BrokenPipeWriter;
+        report_with(rx, Some(control_tx), exit.clone(), |value| {
+            emit_line(&mut writer, value)
+        })
+        .await;
+
+        assert_eq!(*control_rx.borrow(), TransferControl::Stop);
+        assert_eq!(exit.load(Ordering::SeqCst), STOP_EXIT_CODE);
     }
 
     #[test]
