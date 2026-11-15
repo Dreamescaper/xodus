@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::vec;
 
 use fs2::available_space;
@@ -100,6 +102,7 @@ pub async fn run(
             }
         };
         let urls = vec![source.clone()];
+        let preferred_host = Arc::new(AtomicUsize::new(0));
         run_cli_reader(
             client,
             tokens,
@@ -110,6 +113,8 @@ pub async fn run(
             f,
             l,
             &urls,
+            preferred_host,
+            l,
             tx,
             rx,
         )
@@ -190,6 +195,7 @@ pub async fn run(
             }
         };
         let l = http_file.len();
+        let preferred_host = Arc::new(AtomicUsize::new(http_file.url_index()));
 
         run_cli_reader(
             client,
@@ -201,6 +207,8 @@ pub async fn run(
             http_file,
             l,
             &urls,
+            preferred_host,
+            l,
             tx,
             rx,
         )
@@ -219,6 +227,8 @@ async fn run_cli_reader<Reader>(
     reader: Reader,
     l: u64,
     urls: &[String],
+    preferred_host: Arc<AtomicUsize>,
+    expected_total: u64,
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
 ) -> ExitCode
@@ -273,6 +283,8 @@ where
         reader,
         l,
         urls,
+        preferred_host,
+        expected_total,
         &tx,
     )
     .await;
@@ -292,6 +304,8 @@ async fn run_reader<Reader>(
     reader: Reader,
     l: u64,
     urls: &[String],
+    preferred_host: Arc<AtomicUsize>,
+    expected_total: u64,
     tx: &Sender<ProgressEvent>,
 ) -> ExitCode
 where
@@ -509,15 +523,30 @@ where
         .collect();
 
     let total_size: u64 = jobs.iter().map(|job| job.content.length).sum();
-    let saved: u64 = jobs
+    let offset_requests: Vec<(String, u64)> = jobs
         .iter()
-        .map(|job| {
-            journal
-                .lock()
-                .expect("journal lock poisoned")
-                .offset(&job.name, job.content.length)
-        })
-        .sum();
+        .map(|job| (job.name.clone(), job.content.length))
+        .collect();
+    let journal_for_offsets = journal.clone();
+    let offsets = match tokio::task::spawn_blocking(move || {
+        let journal = journal_for_offsets.lock().expect("journal lock poisoned");
+        offset_requests
+            .into_iter()
+            .map(|(name, length)| {
+                let offset = journal.offset(&name, length);
+                (name, offset)
+            })
+            .collect::<HashMap<String, u64>>()
+    })
+    .await
+    {
+        Ok(offsets) => offsets,
+        Err(err) => {
+            eprintln!("could not read download checkpoints: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let saved: u64 = offsets.values().sum();
 
     let required_free_space = total_size.saturating_sub(saved);
     let available_free_space = match available_space(out) {
@@ -571,6 +600,8 @@ where
             let tx = tx.clone();
             let client = client.clone();
             let journal = journal.clone();
+            let preferred_host = preferred_host.clone();
+            let offsets = &offsets;
             async move {
                 download_segment(
                     remote_xvd_ref,
@@ -581,7 +612,10 @@ where
                     id,
                     &tx,
                     full_key,
-                    &journal,
+                    offsets,
+                    journal,
+                    preferred_host,
+                    expected_total,
                 )
                 .await
             }
@@ -602,7 +636,28 @@ where
         );
         return ExitCode::FAILURE;
     }
+    let _ = std::fs::remove_file(out.join(resume::JOURNAL_FILE));
     ExitCode::SUCCESS
+}
+
+async fn checkpoint_blocking(
+    journal: Arc<std::sync::Mutex<resume::Journal>>,
+    name: String,
+    offset: u64,
+) -> Result<(), String> {
+    if offset == 0 {
+        return Ok(());
+    }
+    let label = name.clone();
+    tokio::task::spawn_blocking(move || {
+        journal
+            .lock()
+            .expect("journal lock poisoned")
+            .checkpoint(&name, offset)
+    })
+    .await
+    .map_err(|err| format!("checkpoint task failed for {label}: {err}"))?
+    .map_err(|err| format!("could not checkpoint segment {label}: {err}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -615,7 +670,10 @@ async fn download_segment(
     id: usize,
     tx: &Sender<ProgressEvent>,
     full_key: [u8; 32],
-    journal: &std::sync::Mutex<resume::Journal>,
+    offsets: &HashMap<String, u64>,
+    journal: Arc<std::sync::Mutex<resume::Journal>>,
+    preferred_host: Arc<AtomicUsize>,
+    expected_total: u64,
 ) -> Result<(), String> {
     let url = urls.first().map(String::as_str).unwrap_or("<unknown>");
     let target_file = resume::target(out, &job.name)
@@ -646,10 +704,7 @@ async fn download_segment(
         }
     };
 
-    let mut offset = journal
-        .lock()
-        .expect("journal lock poisoned")
-        .offset(&job.name, job.content.length);
+    let mut offset = offsets.get(&job.name).copied().unwrap_or(0);
     if url.starts_with("file://") {
         offset = 0;
     }
@@ -693,11 +748,7 @@ async fn download_segment(
         return Ok(());
     }
 
-    journal
-        .lock()
-        .expect("journal lock poisoned")
-        .checkpoint(&job.name, offset)
-        .map_err(|err| format!("could not checkpoint segment {}: {err}", job.name))?;
+    checkpoint_blocking(journal.clone(), job.name.clone(), offset).await?;
 
     if let Some(fpath) = url.strip_prefix("file://") {
         let mut i = match File::open(fpath).await {
@@ -724,11 +775,17 @@ async fn download_segment(
                 progress,
                 offset,
                 |position| {
-                    journal
-                        .lock()
-                        .expect("journal lock poisoned")
-                        .checkpoint(&job.name, position)
+                    let journal = journal.clone();
+                    let name = job.name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        journal
+                            .lock()
+                            .expect("journal lock poisoned")
+                            .checkpoint(&name, position)
+                    })
                 },
+                preferred_host,
+                expected_total,
             )
             .await
             .map_err(|err| {

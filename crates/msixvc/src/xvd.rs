@@ -2,12 +2,14 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aes::cipher::KeyInit;
 use aes::{Aes128Dec, Aes128Enc};
 use futures_util::StreamExt;
 use msixvc_common::parse::{BinaryParse, BinaryTryParse};
-use reqwest::header::RANGE;
+use reqwest::header::{CONTENT_RANGE, RANGE};
 use tokio::fs::OpenOptions;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -29,14 +31,14 @@ use crate::models::xvd::{
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
 
-const MAX_RECONNECT_ATTEMPTS: usize = 5;
+pub(crate) const MAX_RECONNECT_ATTEMPTS: usize = 5;
 
 #[cfg(not(test))]
 const RECONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(test)]
 const RECONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
 
-fn reconnect_backoff(attempt: usize) -> std::time::Duration {
+pub(crate) fn reconnect_backoff(attempt: usize) -> std::time::Duration {
     RECONNECT_INITIAL_BACKOFF * 2u32.pow(attempt as u32)
 }
 
@@ -343,11 +345,59 @@ type SegmentByteStream = std::pin::Pin<
     Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
 >;
 
+fn content_range_matches(
+    response: &reqwest::Response,
+    expected_start: u64,
+    expected_total: u64,
+    requested_end: u64,
+) -> bool {
+    let Some(raw) = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(raw) = raw.strip_prefix("bytes ") else {
+        return false;
+    };
+    let Some((bounds, total)) = raw.split_once('/') else {
+        return false;
+    };
+    let Some((start, last)) = bounds.split_once('-') else {
+        return false;
+    };
+    let (Ok(start), Ok(last), Ok(total)) = (
+        start.parse::<u64>(),
+        last.parse::<u64>(),
+        total.parse::<u64>(),
+    ) else {
+        return false;
+    };
+    start == expected_start && last >= start && last <= requested_end && total == expected_total
+}
+
+async fn checkpoint_if_needed<Checkpoint>(
+    checkpoint: &mut Checkpoint,
+    offset: u64,
+) -> std::io::Result<()>
+where
+    Checkpoint: FnMut(u64) -> tokio::task::JoinHandle<std::io::Result<()>>,
+{
+    if offset == 0 {
+        // An absent journal entry already means offset zero.
+        return Ok(());
+    }
+    checkpoint(offset).await.map_err(std::io::Error::other)??;
+    Ok(())
+}
+
 async fn open_segment_stream(
     client: &reqwest::Client,
     url: &str,
     start: u64,
     end: u64,
+    expected_total: u64,
     stall_timeout: tokio::time::Duration,
 ) -> Option<SegmentByteStream> {
     match timeout(
@@ -360,7 +410,12 @@ async fn open_segment_stream(
     .await
     .map(|o| o.map(|o| o.error_for_status()))
     {
-        Ok(Ok(Ok(response))) if response.status() == 206 => Some(Box::pin(response.bytes_stream())),
+        Ok(Ok(Ok(response)))
+            if response.status() == 206
+                && content_range_matches(&response, start, expected_total, end) =>
+        {
+            Some(Box::pin(response.bytes_stream()))
+        }
         _ => None,
     }
 }
@@ -914,11 +969,13 @@ impl XvdFile {
         mut progress: Progress,
         resume_offset: u64,
         mut checkpoint: Checkpoint,
+        preferred_host: Arc<AtomicUsize>,
+        expected_total: u64,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         Writer: AsyncWrite + Unpin,
         Progress: FnMut(u64, u64),
-        Checkpoint: FnMut(u64) -> std::io::Result<()>,
+        Checkpoint: FnMut(u64) -> tokio::task::JoinHandle<std::io::Result<()>>,
     {
         if urls.is_empty() {
             return Err(io::Error::new(
@@ -980,12 +1037,13 @@ impl XvdFile {
 
         let stall_timeout = tokio::time::Duration::from_secs(5);
         let mut reconnect_attempts = 0usize;
-        let mut url_index = 0usize;
+        let mut url_index = preferred_host.load(Ordering::Relaxed).min(urls.len() - 1);
         let mut stream = open_segment_stream(
             client,
             &urls[url_index],
             sfile.offset + v,
             sfile.offset + page_length - 1,
+            expected_total,
             stall_timeout,
         )
         .await;
@@ -1003,15 +1061,27 @@ impl XvdFile {
                 _ => {
                     if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
                         out.flush().await?;
-                        checkpoint(sfile.length - remaining)?;
+                        checkpoint_if_needed(&mut checkpoint, sfile.length - remaining).await?;
                         if url_index + 1 < urls.len() {
-                            url_index += 1;
+                            let attempted = url_index + 1;
+                            let chosen = match preferred_host.compare_exchange(
+                                url_index,
+                                attempted,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => attempted,
+                                Err(current) => current.max(attempted),
+                            }
+                            .min(urls.len() - 1);
+                            url_index = chosen;
                             reconnect_attempts = 0;
                             stream = open_segment_stream(
                                 client,
                                 &urls[url_index],
                                 sfile.offset + v,
                                 sfile.offset + page_length - 1,
+                                expected_total,
                                 stall_timeout,
                             )
                             .await;
@@ -1036,6 +1106,7 @@ impl XvdFile {
                         &urls[url_index],
                         sfile.offset + v,
                         sfile.offset + page_length - 1,
+                        expected_total,
                         stall_timeout,
                     )
                     .await;
@@ -1107,20 +1178,20 @@ impl XvdFile {
             let written = sfile.length - remaining;
             if written.saturating_sub(last_checkpoint) >= 32 * 1024 * 1024 {
                 out.flush().await?;
-                checkpoint(written)?;
+                checkpoint_if_needed(&mut checkpoint, written).await?;
                 last_checkpoint = written;
             }
         }
         if remaining > 0 {
             out.flush().await?;
-            checkpoint(sfile.length - remaining)?;
+            checkpoint_if_needed(&mut checkpoint, sfile.length - remaining).await?;
             return Err(Box::new(std::io::Error::other(format!(
                 "{} of {} missing have {}",
                 remaining, sfile.length, v
             ))));
         }
         out.flush().await?;
-        checkpoint(sfile.length)?;
+        checkpoint_if_needed(&mut checkpoint, sfile.length).await?;
         Ok(())
     }
 
@@ -1363,7 +1434,9 @@ mod tests {
                 [0u8; 32],
                 |_, _| {},
                 0,
-                |_| Ok(()),
+                |_| tokio::task::spawn_blocking(|| Ok(())),
+                Arc::new(AtomicUsize::new(0)),
+                PAGE_SIZE as u64,
             )
             .await?;
         Ok(out)
@@ -1403,6 +1476,7 @@ mod tests {
         Always500,
         ServeRange,
         ServePrefixThenFail(usize),
+        WrongTotal,
     }
 
     async fn spawn_range_server(
@@ -1447,7 +1521,7 @@ mod tests {
                 connection += 1;
                 let serve = match &mode {
                     RangeMode::Always500 => false,
-                    RangeMode::ServeRange => true,
+                    RangeMode::ServeRange | RangeMode::WrongTotal => true,
                     RangeMode::ServePrefixThenFail(_) => is_first,
                 };
                 if !serve {
@@ -1464,11 +1538,15 @@ mod tests {
                     RangeMode::ServePrefixThenFail(prefix) => (*prefix).min(slice.len()),
                     _ => slice.len(),
                 };
+                let reported_total = match &mode {
+                    RangeMode::WrongTotal => body.len() + 1,
+                    _ => body.len(),
+                };
                 let headers = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{}\r\nConnection: close\r\n\r\n",
                     slice.len(),
                     body.len().saturating_sub(1),
-                    body.len()
+                    reported_total
                 );
                 let _ = socket.write_all(headers.as_bytes()).await;
                 let _ = socket.write_all(&slice[..write_len]).await;
@@ -1481,6 +1559,7 @@ mod tests {
     async fn download_urls(
         urls: &[String],
         segment: &SegmentFile,
+        preferred_host: Arc<AtomicUsize>,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let mut out = Vec::new();
@@ -1493,7 +1572,9 @@ mod tests {
                 [0u8; 32],
                 |_, _| {},
                 0,
-                |_| Ok(()),
+                |_| tokio::task::spawn_blocking(|| Ok(())),
+                preferred_host,
+                segment.length,
             )
             .await?;
         Ok(out)
@@ -1515,9 +1596,13 @@ mod tests {
         let (second, requests, second_server) =
             spawn_range_server(body.clone(), RangeMode::ServeRange).await;
 
-        let out = download_urls(&[first, second], &segment_of_length(PAGE_SIZE as u64))
-            .await
-            .expect("the second host must serve the segment");
+        let out = download_urls(
+            &[first, second],
+            &segment_of_length(PAGE_SIZE as u64),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .expect("the second host must serve the segment");
 
         assert_eq!(out, body);
         assert_eq!(requests.lock().unwrap().len(), 1);
@@ -1535,9 +1620,13 @@ mod tests {
         let (second, requests, second_server) =
             spawn_range_server(body.clone(), RangeMode::ServeRange).await;
 
-        let out = download_urls(&[first, second], &segment_of_length(body.len() as u64))
-            .await
-            .expect("the next host must resume the segment");
+        let out = download_urls(
+            &[first, second],
+            &segment_of_length(body.len() as u64),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .expect("the next host must resume the segment");
 
         assert_eq!(out, body);
         let ranges = requests.lock().unwrap().clone();
@@ -1549,5 +1638,126 @@ mod tests {
         );
         first_server.abort();
         second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_reports_when_all_hosts_fail() {
+        let body: Vec<u8> = (0..PAGE_SIZE).map(|index| (index % 251) as u8).collect();
+        let (first, _, first_server) = spawn_range_server(body.clone(), RangeMode::Always500).await;
+        let (second, _, second_server) =
+            spawn_range_server(body.clone(), RangeMode::Always500).await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download_urls(
+                &[first, second],
+                &segment_of_length(PAGE_SIZE as u64),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        )
+        .await
+        .expect("all hosts failing must not hang")
+        .expect_err("every host must fail")
+        .to_string();
+
+        assert!(error.contains("5 reconnect attempts"), "{error}");
+        assert!(error.contains("on 2 hosts"), "{error}");
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_skips_a_host_with_a_different_package_total() {
+        let body: Vec<u8> = (0..PAGE_SIZE).map(|index| (index % 251) as u8).collect();
+        let (wrong, _, wrong_server) =
+            spawn_range_server(body.clone(), RangeMode::WrongTotal).await;
+        let (correct, requests, correct_server) =
+            spawn_range_server(body.clone(), RangeMode::ServeRange).await;
+
+        let out = download_urls(
+            &[wrong, correct],
+            &segment_of_length(PAGE_SIZE as u64),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .expect("the correct host must serve the segment");
+
+        assert_eq!(out, body);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        wrong_server.abort();
+        correct_server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_reuses_the_shared_preferred_host_across_segments() {
+        let body: Vec<u8> = (0..PAGE_SIZE).map(|index| (index % 251) as u8).collect();
+        let (first, first_requests, first_server) =
+            spawn_range_server(body.clone(), RangeMode::Always500).await;
+        let (second, _, second_server) =
+            spawn_range_server(body.clone(), RangeMode::ServeRange).await;
+        let urls = [first, second];
+        let preferred = Arc::new(AtomicUsize::new(0));
+        let segment = segment_of_length(PAGE_SIZE as u64);
+
+        let first_out = download_urls(&urls, &segment, preferred.clone())
+            .await
+            .expect("the first segment must fall back");
+        let dead_host_requests = first_requests.lock().unwrap().len();
+        let second_out = download_urls(&urls, &segment, preferred.clone())
+            .await
+            .expect("the second segment must start on the working host");
+
+        assert_eq!(first_out, body);
+        assert_eq!(second_out, body);
+        assert_eq!(preferred.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_requests.lock().unwrap().len(),
+            dead_host_requests,
+            "the second segment must not retry the known-dead first host"
+        );
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_resumes_an_encrypted_final_page_at_the_same_offset() {
+        let body: Vec<u8> = (0..PAGE_SIZE * 2)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let segment = SegmentFile {
+            offset: 0,
+            length: 5000,
+            data_hashs: vec![],
+            keep_encrypted: true,
+        };
+        let (url, requests, server) = spawn_range_server(body.clone(), RangeMode::ServeRange).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut out = body[..PAGE_SIZE].to_vec();
+
+        test_xvd()
+            .download_file_http(
+                &client,
+                &[url],
+                &mut out,
+                &segment,
+                [0u8; 32],
+                |_, _| {},
+                PAGE_SIZE as u64,
+                |_| tokio::task::spawn_blocking(|| Ok(())),
+                Arc::new(AtomicUsize::new(0)),
+                body.len() as u64,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out, body);
+        let ranges = requests.lock().unwrap().clone();
+        assert!(
+            ranges
+                .first()
+                .is_some_and(|range| range.starts_with(&format!("bytes={PAGE_SIZE}-"))),
+            "expected the encrypted tail to resume at {PAGE_SIZE}, got {ranges:?}"
+        );
+        server.abort();
     }
 }

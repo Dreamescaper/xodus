@@ -15,6 +15,9 @@ use std::{
 
 use fs2::FileExt;
 
+pub(super) const JOURNAL_FILE: &str = ".xodus-streaming-v1.jsonl";
+const LOCK_FILE: &str = ".xodus-streaming.lock";
+
 pub(super) struct Journal {
     root: PathBuf,
     identity: String,
@@ -64,7 +67,7 @@ pub(super) async fn prepare_output(
 }
 
 pub(super) fn lock(root: &Path) -> io::Result<File> {
-    let path = target(root, ".xodus-streaming.lock")?;
+    let path = target(root, LOCK_FILE)?;
     let file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -78,9 +81,10 @@ pub(super) fn lock(root: &Path) -> io::Result<File> {
 pub(super) fn target(root: &Path, name: &str) -> io::Result<PathBuf> {
     let relative = name.replace('\\', "/");
     let relative = Path::new(&relative);
-    if relative
-        .components()
-        .any(|c| !matches!(c, Component::Normal(_)))
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
     {
         return Err(io::Error::other("unsafe package filename"));
     }
@@ -124,7 +128,8 @@ impl Journal {
 
     pub(super) fn open_with_identity(root: &Path, identity: &Identity) -> io::Result<Self> {
         let identity = identity.0.clone();
-        let path = target(root, ".xodus-streaming-v1.jsonl")?;
+        cleanup_temps(root);
+        let path = target(root, JOURNAL_FILE)?;
         let mut entries = serde_json::Map::new();
         if let Ok(file) = File::open(&path) {
             // A torn final append is ignored; previously synced records survive.
@@ -172,6 +177,8 @@ impl Journal {
     pub(super) fn checkpoint(&mut self, name: &str, offset: u64) -> io::Result<()> {
         let file = target(&self.root, name)?;
         // File data reaches storage before the journal claims it can be resumed.
+        // On macOS std maps sync_data/sync_all to fcntl(F_FULLFSYNC), so this
+        // waits for the drive cache, not only the OS page cache.
         File::open(&file)?.sync_data()?;
         self.append_checkpoint(name, &file, offset)
     }
@@ -179,7 +186,7 @@ impl Journal {
     fn append_checkpoint(&mut self, name: &str, file: &Path, offset: u64) -> io::Result<()> {
         let digest = tail(file, offset)?;
         let entry = serde_json::json!({"offset": offset, "tailSha256": digest});
-        let path = target(&self.root, ".xodus-streaming-v1.jsonl")?;
+        let path = target(&self.root, JOURNAL_FILE)?;
         let mut out = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -195,7 +202,8 @@ impl Journal {
     }
 
     fn compact(&self) -> io::Result<()> {
-        let path = self.root.join(".xodus-streaming-v1.jsonl");
+        // sync_all on macOS also uses fcntl(F_FULLFSYNC).
+        let path = self.root.join(JOURNAL_FILE);
         let temp = self
             .root
             .join(format!(".xodus-streaming-{}.tmp", uuid::Uuid::new_v4()));
@@ -218,6 +226,21 @@ impl Journal {
     }
 }
 
+fn cleanup_temps(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(".xodus-streaming-") && name.ends_with(".tmp") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn tail(path: &Path, offset: u64) -> io::Result<String> {
     let mut file = File::open(path)?;
     if !file.metadata()?.is_file() || file.metadata()?.len() < offset {
@@ -233,6 +256,9 @@ fn tail(path: &Path, offset: u64) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -414,6 +440,110 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     }
 
+    #[test]
+    fn streaming_resume_removes_stale_compaction_temps() {
+        let root = tempfile::tempdir().unwrap();
+        let stale = root.path().join(".xodus-streaming-dead.tmp");
+        std::fs::write(&stale, b"partial").unwrap();
+        let files = HashMap::from([(
+            "game.bin".to_owned(),
+            SegmentFile {
+                offset: 0,
+                length: 0,
+                keep_encrypted: false,
+                data_hashs: vec![],
+            },
+        )]);
+        Journal::open(root.path(), "package", &files).unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn streaming_resume_target_rejects_unsafe_paths() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "/absolute",
+            "\\absolute",
+            "a\\..\\b",
+            "a/../b",
+        ] {
+            assert!(target(root.path(), name).is_err(), "{name:?}");
+        }
+        assert!(target(root.path(), "dir\\file.bin").is_ok());
+        assert!(target(root.path(), "dir/file.bin").is_ok());
+
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        assert!(target(root.path(), "link/file.bin").is_err());
+    }
+
+    #[test]
+    fn streaming_resume_torn_and_garbage_journal_lines_preserve_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let files = HashMap::from([
+            (
+                "a".to_owned(),
+                SegmentFile {
+                    offset: 0,
+                    length: 8192,
+                    keep_encrypted: false,
+                    data_hashs: vec![],
+                },
+            ),
+            (
+                "b".to_owned(),
+                SegmentFile {
+                    offset: 0,
+                    length: 8192,
+                    keep_encrypted: false,
+                    data_hashs: vec![],
+                },
+            ),
+        ]);
+        fs::write(root.path().join("a"), vec![7; 8192]).unwrap();
+        fs::write(root.path().join("b"), vec![8; 8192]).unwrap();
+        let mut journal = Journal::open(root.path(), "package", &files).unwrap();
+        journal.checkpoint("a", 4096).unwrap();
+        journal.checkpoint("b", 4096).unwrap();
+
+        let identity = Journal::identity("package", &files).unwrap().0;
+        let journal_path = root.path().join(JOURNAL_FILE);
+        let mut out = fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        let garbage = serde_json::json!({
+            "schema": 1,
+            "identity": &identity,
+            "file": "a",
+            "checkpoint": {"offset": 4096, "tailSha256": "garbage"},
+        });
+        writeln!(out, "{garbage}").unwrap();
+        write!(
+            out,
+            "{{\"schema\":1,\"identity\":\"{identity}\",\"file\":\"b\""
+        )
+        .unwrap();
+        out.sync_all().unwrap();
+        drop(out);
+
+        let journal = Journal::open(root.path(), "package", &files).unwrap();
+        assert_eq!(
+            journal.offset("a", 8192),
+            0,
+            "a bad tail digest restarts only that file"
+        );
+        assert_eq!(
+            journal.offset("b", 8192),
+            4096,
+            "a torn final line preserves earlier entries"
+        );
+    }
+
     #[tokio::test]
     async fn streaming_resume_interrupted_download_equals_fresh_run() {
         let body: Vec<u8> = (0..16384).map(|n| (n % 251) as u8).collect();
@@ -440,7 +570,9 @@ mod tests {
             .open(&path)
             .await
             .unwrap();
-        let mut journal = Journal::open(root.path(), "package", &files).unwrap();
+        let journal = Arc::new(Mutex::new(
+            Journal::open(root.path(), "package", &files).unwrap(),
+        ));
         let result = xvd
             .download_file_http(
                 &client,
@@ -450,13 +582,23 @@ mod tests {
                 [0; 32],
                 |_, _| {},
                 0,
-                |pos| journal.checkpoint("segment.bin", pos),
+                |pos| {
+                    let journal = journal.clone();
+                    tokio::task::spawn_blocking(move || {
+                        journal.lock().unwrap().checkpoint("segment.bin", pos)
+                    })
+                },
+                Arc::new(AtomicUsize::new(0)),
+                body.len() as u64,
             )
             .await;
         assert!(result.is_err(), "the first host must exhaust its budget");
         drop(output);
 
-        let resumed = journal.offset("segment.bin", content.length);
+        let resumed = journal
+            .lock()
+            .unwrap()
+            .offset("segment.bin", content.length);
         assert_eq!(resumed, 8192, "only fully fsynced pages are resumed");
         let mut output = tokio::fs::OpenOptions::new()
             .read(true)
@@ -465,7 +607,15 @@ mod tests {
             .await
             .unwrap();
         let offset = prepare_output(&mut output, resumed, content).await.unwrap();
-        journal.checkpoint("segment.bin", offset).unwrap();
+        {
+            let journal = journal.clone();
+            tokio::task::spawn_blocking(move || {
+                journal.lock().unwrap().checkpoint("segment.bin", offset)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
 
         let second = spawn_server(body.clone(), None, true).await;
         xvd.download_file_http(
@@ -476,7 +626,14 @@ mod tests {
             [0; 32],
             |_, _| {},
             offset,
-            |pos| journal.checkpoint("segment.bin", pos),
+            |pos| {
+                let journal = journal.clone();
+                tokio::task::spawn_blocking(move || {
+                    journal.lock().unwrap().checkpoint("segment.bin", pos)
+                })
+            },
+            Arc::new(AtomicUsize::new(0)),
+            body.len() as u64,
         )
         .await
         .unwrap();
@@ -493,7 +650,9 @@ mod tests {
             [0; 32],
             |_, _| {},
             0,
-            |_| Ok(()),
+            |_| tokio::task::spawn_blocking(|| Ok(())),
+            Arc::new(AtomicUsize::new(0)),
+            body.len() as u64,
         )
         .await
         .unwrap();
