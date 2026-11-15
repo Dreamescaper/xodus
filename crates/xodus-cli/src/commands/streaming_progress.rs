@@ -7,13 +7,22 @@
 
 use super::ProgressEvent;
 use crate::error::CommandError;
+use msixvc::streaming::TransferControl;
 use std::{
-    io::Write,
+    io::{BufRead, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+const MAX_CONTROL_BYTES: usize = 256;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Exit status used when the launcher sends `{"command":"stop"}`.
+pub(super) const STOP_EXIT_CODE: i32 = 129;
 
 /// How a failure should be reported to a JSON consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +30,7 @@ pub(super) enum FailureKind {
     Auth,
     Network,
     Other,
+    Stopped,
 }
 
 impl FailureKind {
@@ -29,6 +39,7 @@ impl FailureKind {
             Self::Auth => "auth",
             Self::Network => "network",
             Self::Other => "other",
+            Self::Stopped => "stopped",
         }
     }
 }
@@ -53,6 +64,10 @@ impl StreamingFailure {
 
     pub(super) fn other(message: impl Into<String>) -> Self {
         Self::new(FailureKind::Other, message)
+    }
+
+    pub(super) fn stopped() -> Self {
+        Self::new(FailureKind::Stopped, "streaming stopped")
     }
 
     pub(super) fn from_command(error: CommandError) -> Self {
@@ -81,6 +96,163 @@ pub(super) fn classify_failure(error: &(dyn std::error::Error + 'static)) -> Fai
         current = error.source();
     }
     FailureKind::Other
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlCommand {
+    Pause,
+    Resume,
+    Stop,
+}
+
+pub(super) fn parse_control(bytes: &[u8]) -> Option<ControlCommand> {
+    if bytes.len() > MAX_CONTROL_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if value.get("schema")? != &serde_json::Value::from(1) {
+        return None;
+    }
+    match value.get("command")?.as_str()? {
+        "pause" => Some(ControlCommand::Pause),
+        "resume" => Some(ControlCommand::Resume),
+        "stop" => Some(ControlCommand::Stop),
+        _ => None,
+    }
+}
+
+/// Read control lines from stdin on a plain thread and turn them into a watch
+/// value and progress events. Returns the sender used by signal handling too.
+pub(super) fn controls(
+    enabled: bool,
+    events: mpsc::Sender<ProgressEvent>,
+    exit: Arc<AtomicI32>,
+) -> (
+    Option<watch::Sender<TransferControl>>,
+    watch::Receiver<TransferControl>,
+) {
+    let (tx, rx) = watch::channel(TransferControl::Running);
+    if !enabled {
+        drop(tx);
+        return (None, rx);
+    }
+    let signal_tx = tx.clone();
+    // A plain thread avoids Tokio's uncancellable blocking-stdin shutdown.
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut bytes = Vec::new();
+        let mut state = TransferControl::Running;
+        loop {
+            bytes.clear();
+            // Bound control records; discard overlong lines without parsing.
+            let result = std::io::Read::take(
+                std::io::Read::by_ref(&mut reader),
+                MAX_CONTROL_BYTES as u64 + 1,
+            )
+            .read_until(b'\n', &mut bytes);
+            if !matches!(result, Ok(n) if n > 0) {
+                break;
+            }
+            if bytes.len() > MAX_CONTROL_BYTES {
+                if bytes.last() != Some(&b'\n') {
+                    reader.skip_until(b'\n').ok();
+                }
+                continue;
+            }
+            match parse_control(&bytes) {
+                Some(ControlCommand::Pause) => {
+                    if state == TransferControl::Paused {
+                        continue;
+                    }
+                    state = TransferControl::Paused;
+                    if tx.send(state).is_err() {
+                        return;
+                    }
+                    if events
+                        .blocking_send(ProgressEvent::Paused { paused: true })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Some(ControlCommand::Resume) => {
+                    if state != TransferControl::Paused {
+                        continue;
+                    }
+                    state = TransferControl::Running;
+                    if tx.send(state).is_err() {
+                        return;
+                    }
+                    if events
+                        .blocking_send(ProgressEvent::Paused { paused: false })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Some(ControlCommand::Stop) => {
+                    exit.store(STOP_EXIT_CODE, Ordering::Relaxed);
+                    tx.send(TransferControl::Stop).ok();
+                    return;
+                }
+                None => {}
+            }
+        }
+        // Losing the controller must never leave a live download parked paused.
+        if release_on_eof(&mut state) {
+            tx.send(TransferControl::Running).ok();
+            events
+                .blocking_send(ProgressEvent::Paused { paused: false })
+                .ok();
+        }
+    });
+    (Some(signal_tx), rx)
+}
+
+/// Apply the stdin-EOF guard: a paused transfer becomes runnable again.
+pub(super) fn release_on_eof(state: &mut TransferControl) -> bool {
+    if *state == TransferControl::Paused {
+        *state = TransferControl::Running;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn install_signal_handlers(
+    sender: watch::Sender<TransferControl>,
+    exit: Arc<AtomicI32>,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+    tokio::spawn(async move {
+        let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+            return;
+        };
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        let code = tokio::select! {
+            _ = interrupt.recv() => 130,
+            _ = terminate.recv() => 143,
+        };
+        exit.store(code, Ordering::Relaxed);
+        sender.send(TransferControl::Stop).ok();
+    });
+}
+
+#[cfg(not(unix))]
+pub(super) fn install_signal_handlers(
+    sender: watch::Sender<TransferControl>,
+    exit: Arc<AtomicI32>,
+) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            exit.store(130, Ordering::Relaxed);
+            sender.send(TransferControl::Stop).ok();
+        }
+    });
 }
 
 pub(super) struct Throttle {
@@ -276,6 +448,19 @@ pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>) {
                 force = true;
                 rate.reset(state.bytes_done, now);
             }
+            ProgressEvent::Paused { paused } => {
+                state.paused = paused;
+                throttle.ready(true);
+                sequence += 1;
+                let rate = rate.update(state.bytes_done, paused, now);
+                emit(&record(
+                    &state,
+                    sequence,
+                    if paused { "paused" } else { "resumed" },
+                    rate,
+                ));
+                continue;
+            }
             ProgressEvent::Completed => {
                 sequence += 1;
                 emit(&done_record(sequence));
@@ -284,6 +469,11 @@ pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>) {
             ProgressEvent::Failed { kind, message } => {
                 sequence += 1;
                 emit(&error_record(sequence, kind, &message));
+                break;
+            }
+            ProgressEvent::Stopped => {
+                sequence += 1;
+                emit(&record(&state, sequence, "stopped", 0));
                 break;
             }
         }
@@ -443,6 +633,60 @@ mod tests {
         assert!(!text.contains("1234567890123456"), "{text}");
         assert!(text.contains("<path>"), "{text}");
         assert!(text.contains("<id>"), "{text}");
+    }
+
+    #[test]
+    fn control_parser_accepts_only_versioned_pause_resume_stop() {
+        assert_eq!(
+            parse_control(br#"{"schema":1,"command":"pause"}"#),
+            Some(ControlCommand::Pause)
+        );
+        assert_eq!(
+            parse_control(b"{\"schema\":1,\"command\":\"resume\"}\n"),
+            Some(ControlCommand::Resume)
+        );
+        assert_eq!(
+            parse_control(br#"{"schema":1,"command":"stop"}"#),
+            Some(ControlCommand::Stop)
+        );
+        for raw in [
+            &br#"{"schema":2,"command":"pause"}"#[..],
+            &br#"{"schema":"1","command":"pause"}"#[..],
+            &br#"{"schema":1,"command":"rewind"}"#[..],
+            &br#"{"schema":1}"#[..],
+            &b"not json"[..],
+            &b""[..],
+            &b"null"[..],
+        ] {
+            assert_eq!(parse_control(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn overlong_control_lines_are_ignored() {
+        let mut raw = br#"{"schema":1,"command":"pause"}"#.to_vec();
+        raw.resize(MAX_CONTROL_BYTES + 1, b' ');
+        assert_eq!(parse_control(&raw), None);
+        assert_eq!(
+            parse_control(br#"{"schema":1,"command":"pause"} "#),
+            Some(ControlCommand::Pause),
+            "a line within the bound is still accepted"
+        );
+    }
+
+    #[test]
+    fn stdin_eof_releases_only_a_paused_transfer() {
+        let mut paused = TransferControl::Paused;
+        assert!(release_on_eof(&mut paused));
+        assert_eq!(paused, TransferControl::Running);
+
+        let mut running = TransferControl::Running;
+        assert!(!release_on_eof(&mut running));
+        assert_eq!(running, TransferControl::Running);
+
+        let mut stopped = TransferControl::Stop;
+        assert!(!release_on_eof(&mut stopped));
+        assert_eq!(stopped, TransferControl::Stop);
     }
 
     #[test]

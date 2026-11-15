@@ -2,17 +2,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::vec;
 
 use fs2::available_space;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use msixvc::streaming;
+use msixvc::streaming::{self, TransferControl};
 use msixvc::xvd::{SegmentFile, XvdFile};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::watch;
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
@@ -75,10 +76,14 @@ enum ProgressEvent {
         saved: u64,
         files: usize,
     },
+    Paused {
+        paused: bool,
+    },
     Failed {
         kind: progress::FailureKind,
         message: String,
     },
+    Stopped,
     Completed,
 }
 
@@ -122,6 +127,12 @@ fn progress_name(path: &str) -> String {
     format!("...{}", &path[start..])
 }
 
+fn stop_requested(control: &Option<watch::Receiver<TransferControl>>) -> bool {
+    control
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow() == TransferControl::Stop)
+}
+
 fn report_failure(progress_json: bool, kind: progress::FailureKind, message: &str) {
     if progress_json {
         progress::emit_error(kind, message);
@@ -150,6 +161,14 @@ pub async fn run(
     } = options;
     let progress_json = progress_mode == ProgressMode::Json;
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+    let exit_code = Arc::new(AtomicI32::new(0));
+    let (control_sender, control) =
+        progress::controls(progress_json, tx.clone(), exit_code.clone());
+    let control = if progress_json { Some(control) } else { None };
+    if let Some(sender) = control_sender {
+        progress::install_signal_handlers(sender, exit_code.clone());
+    }
+
     if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
         let f = match File::open(fsrc).await {
@@ -193,6 +212,8 @@ pub async fn run(
             tx,
             rx,
             progress_json,
+            control,
+            exit_code,
         )
         .await
     } else {
@@ -319,6 +340,8 @@ pub async fn run(
             tx,
             rx,
             progress_json,
+            control,
+            exit_code,
         )
         .await
     }
@@ -340,6 +363,8 @@ async fn run_cli_reader<Reader>(
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
     progress_json: bool,
+    control: Option<watch::Receiver<TransferControl>>,
+    exit_code: Arc<AtomicI32>,
 ) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
@@ -382,7 +407,12 @@ where
                     total_progess.set_message(name);
                 }
                 ProgressEvent::Planned { .. } => {}
-                ProgressEvent::Completed | ProgressEvent::Failed { .. } => break,
+                ProgressEvent::Paused { paused } => {
+                    total_progess.set_message(if paused { "Paused" } else { "Downloading" });
+                }
+                ProgressEvent::Completed
+                | ProgressEvent::Failed { .. }
+                | ProgressEvent::Stopped => break,
             }
         }
 
@@ -401,12 +431,23 @@ where
         preferred_host,
         expected_total,
         &tx,
+        control,
     )
     .await;
     let status = match outcome {
         Ok(()) => {
             tx.send(ProgressEvent::Completed).await.ok();
             ExitCode::SUCCESS
+        }
+        Err(failure) if failure.kind == progress::FailureKind::Stopped => {
+            tx.send(ProgressEvent::Stopped).await.ok();
+            let code = exit_code.load(Ordering::SeqCst);
+            let code = if code == 0 {
+                progress::STOP_EXIT_CODE
+            } else {
+                code
+            };
+            ExitCode::from(code as u8)
         }
         Err(failure) => {
             tx.send(ProgressEvent::Failed {
@@ -437,12 +478,17 @@ async fn run_reader<Reader>(
     preferred_host: Arc<AtomicUsize>,
     expected_total: u64,
     tx: &Sender<ProgressEvent>,
+    control: Option<watch::Receiver<TransferControl>>,
 ) -> Result<(), progress::StreamingFailure>
 where
     Reader: AsyncRead + Unpin,
 {
     let out: &Path = Path::new(&destination);
     let source_url = urls.first().map(String::as_str).unwrap_or("<unknown>");
+
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
 
     if let Err(err) = std::fs::create_dir_all(out) {
         eprintln!("could not create destination {}: {err}", out.display());
@@ -601,6 +647,9 @@ where
         }
     }
 
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
     tx.send(ProgressEvent::UpdateStatus {
         name: "Licensing".to_owned(),
     })
@@ -743,6 +792,9 @@ where
         ));
     }
 
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
     tx.send(ProgressEvent::Planned {
         total: total_size,
         saved,
@@ -781,6 +833,7 @@ where
             let client = client.clone();
             let journal = journal.clone();
             let preferred_host = preferred_host.clone();
+            let control = control.clone();
             let offsets = &offsets;
             async move {
                 download_segment(
@@ -794,6 +847,7 @@ where
                     full_key,
                     offsets,
                     journal,
+                    control,
                     preferred_host,
                     expected_total,
                 )
@@ -804,6 +858,9 @@ where
 
     segments?;
 
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
     tx.send(ProgressEvent::UpdateStatus {
         name: "Finalizing".to_owned(),
     })
@@ -859,9 +916,13 @@ async fn download_segment(
     full_key: [u8; 32],
     offsets: &HashMap<String, u64>,
     journal: Arc<std::sync::Mutex<resume::Journal>>,
+    control: Option<watch::Receiver<TransferControl>>,
     preferred_host: Arc<AtomicUsize>,
     expected_total: u64,
 ) -> Result<(), progress::StreamingFailure> {
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
     let url = urls.first().map(String::as_str).unwrap_or("<unknown>");
     let target_file = match resume::target(out, &job.name) {
         Ok(path) => path,
@@ -982,6 +1043,7 @@ async fn download_segment(
                 &job.content,
                 full_key,
                 progress,
+                control.clone(),
                 offset,
                 |position| {
                     let journal = journal.clone();
@@ -998,6 +1060,9 @@ async fn download_segment(
             )
             .await;
         if let Err(err) = result {
+            if stop_requested(&control) {
+                return Err(progress::StreamingFailure::stopped());
+            }
             eprintln!(
                 "could not download segment {} from {}: {err}",
                 job.name,

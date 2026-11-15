@@ -257,9 +257,10 @@ fn tail(path: &Path, offset: u64) -> io::Result<String> {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use msixvc::streaming::TransferControl;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -581,6 +582,7 @@ mod tests {
                 content,
                 [0; 32],
                 |_, _| {},
+                None,
                 0,
                 |pos| {
                     let journal = journal.clone();
@@ -625,6 +627,7 @@ mod tests {
             content,
             [0; 32],
             |_, _| {},
+            None,
             offset,
             |pos| {
                 let journal = journal.clone();
@@ -649,6 +652,7 @@ mod tests {
             content,
             [0; 32],
             |_, _| {},
+            None,
             0,
             |_| tokio::task::spawn_blocking(|| Ok(())),
             Arc::new(AtomicUsize::new(0)),
@@ -660,6 +664,225 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), body);
         assert_eq!(fs::read(&path).unwrap(), fs::read(&fresh_path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn streaming_pause_checkpoints_and_resumes_with_identical_bytes() {
+        use tokio::sync::watch;
+
+        let body: Vec<u8> = (0..16384).map(|n| (n % 251) as u8).collect();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("segment.bin");
+        let files = HashMap::from([(
+            "segment.bin".to_owned(),
+            SegmentFile {
+                offset: 0,
+                length: body.len() as u64,
+                keep_encrypted: false,
+                data_hashs: vec![],
+            },
+        )]);
+        let content = &files["segment.bin"];
+        let xvd = synthetic_xvd().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let journal = Arc::new(Mutex::new(
+            Journal::open(root.path(), "package", &files).unwrap(),
+        ));
+        let server =
+            spawn_throttled_server(body.clone(), 4096, std::time::Duration::from_millis(5)).await;
+        let (control_tx, control_rx) = watch::channel(TransferControl::Running);
+        let paused = Arc::new(AtomicBool::new(false));
+        let pause_signal = paused.clone();
+        let pause_control = control_tx.clone();
+        let resume_control = control_tx.clone();
+        let resume_journal = journal.clone();
+        let length = content.length;
+        let resume_task = tokio::spawn(async move {
+            for _ in 0..400 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let offset = resume_journal.lock().unwrap().offset("segment.bin", length);
+                if paused.load(Ordering::SeqCst) && offset >= 4096 && offset < length {
+                    // Give the transfer a moment to actually park before resuming.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    resume_control.send(TransferControl::Running).ok();
+                    return offset;
+                }
+            }
+            0
+        });
+        let mut output = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            xvd.download_file_http(
+                &client,
+                std::slice::from_ref(&server.url),
+                &mut output,
+                content,
+                [0; 32],
+                move |pos, _| {
+                    if pos >= 4096 && !pause_signal.swap(true, Ordering::SeqCst) {
+                        pause_control.send(TransferControl::Paused).ok();
+                    }
+                },
+                Some(control_rx),
+                0,
+                |pos| {
+                    let journal = journal.clone();
+                    tokio::task::spawn_blocking(move || {
+                        journal.lock().unwrap().checkpoint("segment.bin", pos)
+                    })
+                },
+                Arc::new(AtomicUsize::new(0)),
+                body.len() as u64,
+            ),
+        )
+        .await
+        .expect("pause/resume must finish");
+        result.expect("the resumed transfer must complete");
+        output.flush().await.unwrap();
+
+        let observed = resume_task.await.unwrap();
+        assert!(
+            observed >= 4096 && observed < length,
+            "pause should leave a partial checkpoint, got {observed}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), body);
+        assert_eq!(
+            journal
+                .lock()
+                .unwrap()
+                .offset("segment.bin", content.length),
+            content.length
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_stop_checkpoints_and_resumes_with_identical_bytes() {
+        use tokio::sync::watch;
+
+        let body: Vec<u8> = (0..16384).map(|n| (n % 251) as u8).collect();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("segment.bin");
+        let files = HashMap::from([(
+            "segment.bin".to_owned(),
+            SegmentFile {
+                offset: 0,
+                length: body.len() as u64,
+                keep_encrypted: false,
+                data_hashs: vec![],
+            },
+        )]);
+        let content = &files["segment.bin"];
+        let xvd = synthetic_xvd().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let journal = Arc::new(Mutex::new(
+            Journal::open(root.path(), "package", &files).unwrap(),
+        ));
+        let server =
+            spawn_throttled_server(body.clone(), 4096, std::time::Duration::from_millis(5)).await;
+        let (control_tx, control_rx) = watch::channel(TransferControl::Running);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop_signal = stopped.clone();
+        let stop_control = control_tx.clone();
+        let mut output = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            xvd.download_file_http(
+                &client,
+                std::slice::from_ref(&server.url),
+                &mut output,
+                content,
+                [0; 32],
+                move |pos, _| {
+                    if pos >= 4096 && !stop_signal.swap(true, Ordering::SeqCst) {
+                        stop_control.send(TransferControl::Stop).ok();
+                    }
+                },
+                Some(control_rx),
+                0,
+                |pos| {
+                    let journal = journal.clone();
+                    tokio::task::spawn_blocking(move || {
+                        journal.lock().unwrap().checkpoint("segment.bin", pos)
+                    })
+                },
+                Arc::new(AtomicUsize::new(0)),
+                body.len() as u64,
+            ),
+        )
+        .await
+        .expect("stop must return promptly");
+        assert!(result.is_err(), "stop interrupts the segment transfer");
+        drop(output);
+
+        let resumed = journal
+            .lock()
+            .unwrap()
+            .offset("segment.bin", content.length);
+        assert!(
+            resumed >= 4096 && resumed < content.length,
+            "stop must leave a resumable checkpoint, got {resumed}"
+        );
+
+        let mut output = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let offset = prepare_output(&mut output, resumed, content).await.unwrap();
+        {
+            let journal = journal.clone();
+            tokio::task::spawn_blocking(move || {
+                journal.lock().unwrap().checkpoint("segment.bin", offset)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let second = spawn_server(body.clone(), None, true).await;
+        xvd.download_file_http(
+            &client,
+            std::slice::from_ref(&second.url),
+            &mut output,
+            content,
+            [0; 32],
+            |_, _| {},
+            None,
+            offset,
+            |pos| {
+                let journal = journal.clone();
+                tokio::task::spawn_blocking(move || {
+                    journal.lock().unwrap().checkpoint("segment.bin", pos)
+                })
+            },
+            Arc::new(AtomicUsize::new(0)),
+            body.len() as u64,
+        )
+        .await
+        .unwrap();
+        output.flush().await.unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), body);
+        assert_eq!(
+            journal
+                .lock()
+                .unwrap()
+                .offset("segment.bin", content.length),
+            content.length
+        );
     }
 
     async fn synthetic_xvd() -> msixvc::xvd::XvdFile {
@@ -744,6 +967,67 @@ mod tests {
                         .write_all(&remaining[..fail_after.min(remaining.len())])
                         .await
                         .ok();
+                    socket.shutdown().await.ok();
+                });
+            }
+        });
+        TestServer {
+            url: format!("http://{address}/file"),
+            handle,
+        }
+    }
+
+    async fn spawn_throttled_server(
+        body: Vec<u8>,
+        chunk: usize,
+        delay: std::time::Duration,
+    ) -> TestServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    let range = text.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("range")
+                            .then(|| value.trim().to_owned())
+                    });
+                    let start = range
+                        .as_deref()
+                        .and_then(|r| r.strip_prefix("bytes="))
+                        .and_then(|r| r.split_once('-'))
+                        .and_then(|(start, _)| start.parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(body.len());
+                    let total = body.len();
+                    let headers = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{total}\r\nConnection: close\r\n\r\n",
+                        total - start,
+                        total - 1
+                    );
+                    socket.write_all(headers.as_bytes()).await.ok();
+                    for part in body[start..].chunks(chunk) {
+                        if socket.write_all(part).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
                     socket.shutdown().await.ok();
                 });
             }
