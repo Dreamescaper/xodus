@@ -13,7 +13,7 @@ use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::task::block_in_place;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_util::io::SyncIoBridge;
 use uuid::Uuid;
 use zerocopy::IntoBytes;
@@ -28,6 +28,17 @@ use crate::models::xvd::{
     XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
+
+const MAX_RECONNECT_ATTEMPTS: usize = 5;
+
+#[cfg(not(test))]
+const RECONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const RECONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn reconnect_backoff(attempt: usize) -> std::time::Duration {
+    RECONNECT_INITIAL_BACKOFF * 2u32.pow(attempt as u32)
+}
 
 pub struct SyncSubstream<R> {
     inner: R,
@@ -899,6 +910,7 @@ impl XvdFile {
         let mut v: u64 = 0;
 
         let stall_timeout = tokio::time::Duration::from_secs(5);
+        let mut reconnect_attempts = 0usize;
         if let Ok(Ok(Ok(response))) = timeout(
             stall_timeout,
             client
@@ -928,39 +940,50 @@ impl XvdFile {
             } else {
                 Ok(None)
             };
-            let data;
-            if let Ok(Some(Ok(b))) = next {
-                data = b;
-            } else {
-                // error
-                if let Ok(Ok(Ok(response))) = timeout(
-                    stall_timeout,
-                    client
-                        .get(url)
-                        .header(
-                            RANGE,
-                            format!(
-                                "bytes={}-{}",
-                                sfile.offset + v,
-                                sfile.offset + page_length - 1
-                            ),
-                        )
-                        .send(),
-                )
-                .await
-                .map(|o| o.map(|o| o.error_for_status()))
-                    && response.status() == 206
-                {
-                    stream = Some(response.bytes_stream());
+            let data = match next {
+                Ok(Some(Ok(data))) if !data.is_empty() => data,
+                _ => {
+                    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                        return Err(io::Error::other(format!(
+                            "download interrupted for segment at offset {} (length {}): {} reconnect attempts failed ({} of {} bytes received)",
+                            sfile.offset,
+                            sfile.length,
+                            reconnect_attempts,
+                            v,
+                            sfile.length
+                        ))
+                        .into());
+                    }
+                    let backoff = reconnect_backoff(reconnect_attempts);
+                    reconnect_attempts += 1;
+                    sleep(backoff).await;
+                    stream = match timeout(
+                        stall_timeout,
+                        client
+                            .get(url)
+                            .header(
+                                RANGE,
+                                format!(
+                                    "bytes={}-{}",
+                                    sfile.offset + v,
+                                    sfile.offset + page_length - 1
+                                ),
+                            )
+                            .send(),
+                    )
+                    .await
+                    .map(|o| o.map(|o| o.error_for_status()))
+                    {
+                        Ok(Ok(Ok(response))) if response.status() == 206 => {
+                            Some(response.bytes_stream())
+                        }
+                        _ => None,
+                    };
                     continue;
                 }
-                return Err(io::Error::other(format!(
-                    "download interrupted at {} of {} bytes (segment offset {})",
-                    v, sfile.length, sfile.offset
-                ))
-                .into());
-            }
+            };
 
+            reconnect_attempts = 0;
             v += data.len() as u64;
             progress(min(v, sfile.length), sfile.length);
 
@@ -1185,66 +1208,120 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[tokio::test]
-    async fn download_error_is_propagated_instead_of_retrying_forever() {
+    enum ServerMode {
+        NotFound,
+        DropFirstThenServe(Vec<u8>),
+    }
+
+    async fn spawn_server(mode: ServerMode) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let mut connection = 0usize;
             while let Ok((mut socket, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while let Ok(1) = socket.read(&mut byte).await {
-                        request.push(byte[0]);
-                        if request.ends_with(b"\r\n\r\n") {
-                            break;
-                        }
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while let Ok(1) = socket.read(&mut byte).await {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
                     }
-                    let _ = socket
-                        .write_all(
-                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await;
-                    let _ = socket.shutdown().await;
-                });
+                }
+
+                let current = connection;
+                connection += 1;
+                match &mode {
+                    ServerMode::NotFound => {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                    ServerMode::DropFirstThenServe(_) if current == 0 => {}
+                    ServerMode::DropFirstThenServe(body) => {
+                        let length = body.len();
+                        let headers = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\nContent-Range: bytes 0-{}/{length}\r\nConnection: close\r\n\r\n",
+                            length.saturating_sub(1)
+                        );
+                        let _ = socket.write_all(headers.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                    }
+                }
+                let _ = socket.shutdown().await;
             }
         });
+        (address, handle)
+    }
 
+    fn test_xvd() -> XvdFile {
         let mut header = XvdHeader::buffer();
         header[0x200..0x208].copy_from_slice(b"msft-xvd");
         header[0x210..0x218].copy_from_slice(&116_444_736_000_000_000i64.to_le_bytes());
         header[0x218..0x220].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
         let header = XvdHeader::try_from_array(&header).unwrap();
         let layout = header.layout().unwrap();
-        let xvd = XvdFile {
+        XvdFile {
             header,
             layout,
             encrypted_section_infos: vec![],
-        };
+        }
+    }
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let mut out = Vec::new();
-        let sfile = SegmentFile {
+    fn test_segment() -> SegmentFile {
+        SegmentFile {
             offset: 0,
             length: PAGE_SIZE as u64,
             data_hashs: vec![],
             keep_encrypted: false,
-        };
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            xvd.download_file_http(
+        }
+    }
+
+    async fn download(
+        address: std::net::SocketAddr,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut out = Vec::new();
+        test_xvd()
+            .download_file_http(
                 &client,
                 &format!("http://{address}/file"),
                 &mut out,
-                &sfile,
+                &test_segment(),
                 [0u8; 32],
                 |_, _| {},
-            ),
-        )
-        .await
-        .expect("a failing download must not hang");
+            )
+            .await?;
+        Ok(out)
+    }
 
-        assert!(result.is_err());
+    #[tokio::test]
+    async fn download_reconnects_after_a_dropped_connection() {
+        let body: Vec<u8> = (0..PAGE_SIZE).map(|index| (index % 251) as u8).collect();
+        let (address, server) = spawn_server(ServerMode::DropFirstThenServe(body.clone())).await;
+
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), download(address))
+            .await
+            .expect("a reconnect must complete")
+            .expect("the segment should download after one reconnect");
+
+        assert_eq!(out, body);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_exhausts_the_reconnect_budget() {
+        let (address, server) = spawn_server(ServerMode::NotFound).await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), download(address))
+            .await
+            .expect("a failing download must not hang")
+            .expect_err("five failed reconnects must return an error")
+            .to_string();
+
+        assert!(error.contains("5 reconnect attempts"), "{error}");
+        assert!(error.contains("offset 0"), "{error}");
         server.abort();
     }
 }

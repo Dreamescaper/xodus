@@ -22,6 +22,19 @@ pub enum LicenseContentError {
     NotEntitled { description: String },
 }
 
+impl LicenseContentError {
+    pub fn without_url(self) -> Self {
+        match self {
+            Self::Request(error) => Self::Request(error.without_url()),
+            other => other,
+        }
+    }
+
+    pub fn is_network_request(&self) -> bool {
+        matches!(self, Self::Request(_))
+    }
+}
+
 // we might need a bump in xal-rs concerning reqwest,
 // that might block us from using the correlationvector extension
 pub async fn get_license_content(

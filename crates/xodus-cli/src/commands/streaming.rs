@@ -498,7 +498,7 @@ where
 
     let remote_xvd_ref = &remote_xvd;
     let full_key = *full_key;
-    let jobs = rfiles
+    let jobs: Vec<Job> = rfiles
         .iter()
         .filter(|(k, v1)| {
             if let Some(v2) = lfiles.get(*k) {
@@ -516,9 +516,21 @@ where
                 keep_encrypted: v.keep_encrypted,
             },
         })
-        .enumerate();
+        .collect();
+
+    if !jobs.is_empty()
+        && let Err(err) = std::fs::remove_file(&final_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "could not remove previous streaming package {}: {err}",
+            final_path.display()
+        );
+        return ExitCode::FAILURE;
+    }
 
     let segments = stream::iter(jobs)
+        .enumerate()
         .map(Ok::<_, String>)
         .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
             let tx = tx.clone();
