@@ -147,6 +147,31 @@ fn report_error(progress_json: bool, error: &(dyn std::error::Error + 'static)) 
     }
 }
 
+/// Provision device credentials before the first device-dependent operation,
+/// reporting failures the same way as every other streaming failure.
+async fn ensure_device(
+    client: &reqwest::Client,
+    tokens: &TokenManager,
+    control: &Option<watch::Receiver<TransferControl>>,
+    progress_json: bool,
+    exit_code: &AtomicI32,
+) -> Result<(), ExitCode> {
+    let provisioned = until_stopped(control, crate::device::ensure(client, tokens)).await;
+    let provisioned = match provisioned {
+        Err(_) => return Err(stopped_exit(progress_json, exit_code)),
+        Ok(result) => result,
+    };
+    if let Err(err) = provisioned {
+        eprintln!("{err}");
+        if progress_json {
+            let kind = progress::classify_failure(&err);
+            progress::emit_error(kind, kind.message());
+        }
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(())
+}
+
 fn stopped_exit(progress_json: bool, exit_code: &AtomicI32) -> ExitCode {
     if progress_json {
         progress::emit_stopped();
@@ -286,6 +311,7 @@ pub async fn run(
         )
         .await
     } else {
+        let mut device_ready = false;
         let urls: Vec<String> = if source.starts_with("http://") || source.starts_with("https://") {
             vec![source]
         } else {
@@ -317,19 +343,12 @@ pub async fn run(
             } else {
                 source
             };
-            let provisioned = until_stopped(&control, crate::device::ensure(client, tokens)).await;
-            let provisioned = match provisioned {
-                Err(_) => return stopped_exit(progress_json, &exit_code),
-                Ok(result) => result,
-            };
-            if let Err(err) = provisioned {
-                eprintln!("{err}");
-                if progress_json {
-                    let kind = progress::classify_failure(&err);
-                    progress::emit_error(kind, kind.message());
-                }
-                return ExitCode::FAILURE;
+            if let Err(code) =
+                ensure_device(client, tokens, &control, progress_json, &exit_code).await
+            {
+                return code;
             }
+            device_ready = true;
             let package_result =
                 until_stopped(&control, get_packages(client, tokens, content_id.clone())).await;
             let package_result = match package_result {
@@ -374,6 +393,14 @@ pub async fn run(
             }
             urls
         };
+        if !device_ready {
+            if let Err(code) =
+                ensure_device(client, tokens, &control, progress_json, &exit_code).await
+            {
+                return code;
+            }
+            device_ready = true;
+        }
         let Some(first_url) = urls.first() else {
             eprintln!("The server returned no CDN for the package");
             report_failure(
@@ -423,7 +450,7 @@ pub async fn run(
         run_cli_reader(
             client,
             tokens,
-            true,
+            device_ready,
             destination,
             try_skip_ntfs,
             parallel,

@@ -15,7 +15,13 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         eprintln!("{err}");
         return ExitCode::FAILURE;
     }
-    let token = tokens.get_device_sts_token().unwrap();
+    let token = match tokens.get_device_sts_token() {
+        Ok(token) => token,
+        Err(err) => {
+            eprintln!("could not read the device token: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let secrets::Token::Legacy(token) = token else {
         eprintln!("Invalid STS token");
         return ExitCode::FAILURE;

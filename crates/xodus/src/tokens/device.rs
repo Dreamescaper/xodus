@@ -7,6 +7,7 @@ use crate::models::devicecredential::{Authentication, ClientInfo, DeviceAddReque
 use crate::models::secrets::Device;
 use crate::models::soap::BodyContent;
 use crate::tokens::manager::TokenManager;
+use crate::tokens::store::TokenStoreError;
 
 /// Which kind of failure a device provisioning error represents, so callers can
 /// report it the same way they report other command errors.
@@ -67,12 +68,24 @@ pub async fn ensure_device_credentials(
     client: &reqwest::Client,
     tokens: &TokenManager,
 ) -> Result<(), DeviceError> {
-    match tokens.get_device_license() {
-        Err(_) => provision_device(client, tokens).await,
-        Ok(license) if tokens.get_device_sts_token().is_err() => {
-            reauthenticate_device(client, tokens, license).await
+    let license = match tokens.get_device_license() {
+        Ok(license) => license,
+        Err(TokenStoreError::NotFound) => return provision_device(client, tokens).await,
+        Err(err) => {
+            return Err(DeviceError::other(
+                format!("could not read the device license: {err}"),
+                err,
+            ));
         }
+    };
+
+    match tokens.get_device_sts_token() {
         Ok(_) => Ok(()),
+        Err(TokenStoreError::NotFound) => reauthenticate_device(client, tokens, license).await,
+        Err(err) => Err(DeviceError::other(
+            format!("could not read the device token: {err}"),
+            err,
+        )),
     }
 }
 
@@ -145,10 +158,12 @@ async fn reauthenticate_device(
             }
         })?;
 
-    if let BodyContent::RequestSecurityTokenResponse(resp) = resp.body.body {
-        save_device_sts_token(tokens, resp)?;
+    match resp.body.body {
+        BodyContent::RequestSecurityTokenResponse(resp) => save_device_sts_token(tokens, resp),
+        _ => Err(DeviceError::other_message(
+            "unexpected device token response",
+        )),
     }
-    Ok(())
 }
 
 fn save_device_sts_token(
@@ -172,4 +187,113 @@ fn save_device_sts_token(
     tokens
         .save_device_token(key_name, token)
         .map_err(|err| DeviceError::other(format!("could not save the device token: {err}"), err))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::models::secrets::Device;
+    use crate::tokens::backend::MemoryBackend;
+    use crate::tokens::store::{TokenBackend, TokenStoreError};
+
+    use super::{DeviceErrorKind, TokenManager, ensure_device_credentials};
+
+    struct ErroringBackend {
+        device_license: Option<Device>,
+    }
+
+    impl TokenBackend for ErroringBackend {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+            if key == "dev_license"
+                && let Some(device) = &self.device_license
+            {
+                return Ok(Some(serde_json::to_vec(device).unwrap()));
+            }
+            Err(TokenStoreError::Io(io::Error::other("keychain locked")))
+        }
+
+        fn set(&self, _key: &str, _value: &[u8]) -> Result<(), TokenStoreError> {
+            Err(TokenStoreError::Io(io::Error::other("keychain locked")))
+        }
+
+        fn remove(&self, _key: &str) -> Result<(), TokenStoreError> {
+            Err(TokenStoreError::Io(io::Error::other("keychain locked")))
+        }
+    }
+
+    fn manager(device_license: Option<Device>) -> TokenManager {
+        TokenManager::new(
+            Arc::new(ErroringBackend { device_license }),
+            Arc::new(MemoryBackend::default()),
+        )
+    }
+
+    /// Any device provisioning would go through this loopback proxy. The
+    /// listener stays non-blocking so the test can prove it was never used
+    /// without ever reaching Microsoft.
+    fn guarded_client() -> (reqwest::Client, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(250))
+            .proxy(reqwest::Proxy::all(proxy).unwrap())
+            .build()
+            .unwrap();
+        (client, listener)
+    }
+
+    fn assert_no_connection(listener: &std::net::TcpListener) {
+        match listener.accept() {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("device provisioning unexpectedly contacted the network"),
+            Err(err) => panic!("proxy listener failed: {err}"),
+        }
+    }
+
+    fn device() -> Device {
+        Device {
+            puid: "puid".to_owned(),
+            hwid: "hwid".to_owned(),
+            device_id: "device".to_owned(),
+            splicense: "not-a-real-license".to_owned(),
+            username: "user".to_owned(),
+            password: "password".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sts_token_store_error_is_returned_without_network() {
+        let (client, listener) = guarded_client();
+        let error = ensure_device_credentials(&client, &manager(Some(device())))
+            .await
+            .expect_err("a non-NotFound token error must be reported");
+
+        assert_eq!(error.kind(), DeviceErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains("could not read the device token")
+        );
+        assert_no_connection(&listener);
+    }
+
+    #[tokio::test]
+    async fn device_license_store_error_is_returned_without_network() {
+        let (client, listener) = guarded_client();
+        let error = ensure_device_credentials(&client, &manager(None))
+            .await
+            .expect_err("a non-NotFound license error must be reported");
+
+        assert_eq!(error.kind(), DeviceErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains("could not read the device license")
+        );
+        assert_no_connection(&listener);
+    }
 }

@@ -543,6 +543,34 @@ mod dispatch_tests {
         }
     }
 
+    /// Records device credential reads and returns a non-NotFound keychain
+    /// error, which must be reported without provisioning or contacting the
+    /// network.
+    struct RecordingBackend {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TokenBackend for RecordingBackend {
+        fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(TokenStoreError::Io(std::io::Error::other(
+                "keychain locked",
+            )))
+        }
+
+        fn set(&self, _key: &str, _value: &[u8]) -> Result<(), TokenStoreError> {
+            Err(TokenStoreError::Io(std::io::Error::other(
+                "keychain locked",
+            )))
+        }
+
+        fn remove(&self, _key: &str) -> Result<(), TokenStoreError> {
+            Err(TokenStoreError::Io(std::io::Error::other(
+                "keychain locked",
+            )))
+        }
+    }
+
     fn forbidden_tokens() -> TokenManager {
         TokenManager::new(
             Arc::new(ForbiddenBackend),
@@ -586,6 +614,74 @@ mod dispatch_tests {
 
         let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
         assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn streaming_url_provisions_before_opening_the_source() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let destination = work.path().join("output").to_string_lossy().into_owned();
+        let source = format!("http://{address}/package.msixvc");
+        let args = CliArgs::try_parse_from(["xodus-cli", "streaming", &source, &destination])
+            .expect("failed to parse streaming arguments");
+
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tokens = TokenManager::new(
+            Arc::new(RecordingBackend {
+                reads: reads.clone(),
+            }),
+            Arc::new(MemoryBackend::default()),
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let code = dispatch(args.command, false, &client, &tokens).await;
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the URL path must provision before licensing"
+        );
+        match listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("URL source was opened before device provisioning"),
+            Err(err) => panic!("HTTP listener failed: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_url_validates_the_destination_before_device_or_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let blocker = work.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let destination = blocker.join("output").to_string_lossy().into_owned();
+        let source = format!("http://{address}/package.msixvc");
+        let args = CliArgs::try_parse_from([
+            "xodus-cli",
+            "streaming",
+            &source,
+            &destination,
+            "--sub-product",
+            "NOT-A-PRODUCT",
+        ])
+        .expect("failed to parse streaming arguments");
+
+        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        assert_eq!(code, ExitCode::FAILURE);
+
+        match listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("URL source was opened before the destination was validated"),
+            Err(err) => panic!("HTTP listener failed: {err}"),
+        }
     }
 
     #[tokio::test]
