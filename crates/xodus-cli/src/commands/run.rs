@@ -20,10 +20,36 @@ use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
 
-async fn wait_for_shutdown(sigint: &mut TokioSignal, sigterm: &mut TokioSignal) {
+#[derive(Clone, Copy)]
+enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl ShutdownSignal {
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::Interrupt => 130,
+            Self::Terminate => 143,
+        }
+    }
+}
+
+enum RunFailure {
+    Error(String),
+    Interrupted(u8),
+}
+
+impl From<String> for RunFailure {
+    fn from(error: String) -> Self {
+        Self::Error(error)
+    }
+}
+
+async fn wait_for_shutdown(sigint: &mut TokioSignal, sigterm: &mut TokioSignal) -> ShutdownSignal {
     tokio::select! {
-        _ = sigint.recv() => {}
-        _ = sigterm.recv() => {}
+        _ = sigint.recv() => ShutdownSignal::Interrupt,
+        _ = sigterm.recv() => ShutdownSignal::Terminate,
     }
 }
 
@@ -354,7 +380,7 @@ pub async fn run(
         }
     };
 
-    let result: Result<std::process::ExitStatus, String> = async {
+    let result: Result<std::process::ExitStatus, RunFailure> = async {
         let fds = tokio::select! {
             fds = async {
                 let mut fds: Vec<(&String, std::fs::File)> = Vec::new();
@@ -391,8 +417,8 @@ pub async fn run(
 
                 Ok::<_, String>(fds)
             } => fds?,
-            _ = wait_for_shutdown(&mut sigint, &mut sigterm) => {
-                return Err("Interrupted while preparing the game".to_string());
+            signal = wait_for_shutdown(&mut sigint, &mut sigterm) => {
+                return Err(RunFailure::Interrupted(signal.exit_code()));
             }
         };
 
@@ -426,7 +452,7 @@ pub async fn run(
         }
 
         let Some(nt_entry) = nt_entry else {
-            return Err("Could not find .exe".to_string());
+            return Err(RunFailure::Error("Could not find .exe".to_string()));
         };
 
         let mut wn = Command::new(wine)
@@ -440,15 +466,23 @@ pub async fn run(
             None => {
                 let _ = wn.start_kill();
                 let _ = wn.wait().await;
-                return Err("Failed to get the Wine process id".to_string());
+                return Err(RunFailure::Error(
+                    "Failed to get the Wine process id".to_string(),
+                ));
             }
         };
 
+        let mut interrupted = false;
         let status = loop {
             tokio::select! {
                 status = wn.wait() => break status,
                 _ = wait_for_shutdown(&mut sigint, &mut sigterm) => {
-                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+                    if interrupted {
+                        let _ = wn.start_kill();
+                    } else {
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+                        interrupted = true;
+                    }
                 }
             }
         };
@@ -458,7 +492,7 @@ pub async fn run(
             Err(err) => {
                 let _ = wn.start_kill();
                 let _ = wn.wait().await;
-                return Err(format!("Failed to wait for Wine: {err}"));
+                return Err(RunFailure::Error(format!("Failed to wait for Wine: {err}")));
             }
         };
 
@@ -478,7 +512,14 @@ pub async fn run(
             }
             ExitCode::from(exit_code_value(status))
         }
-        Err(err) => {
+        Err(RunFailure::Interrupted(code)) => {
+            eprintln!("Interrupted while preparing the game");
+            if let Err(err) = cleanup_result {
+                eprintln!("Failed to clean up the RAM disk: {err}");
+            }
+            ExitCode::from(code)
+        }
+        Err(RunFailure::Error(err)) => {
             eprintln!("{err}");
             if let Err(err) = cleanup_result {
                 eprintln!("Failed to clean up the RAM disk: {err}");
@@ -490,9 +531,15 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_exit_code, exit_code_value};
+    use super::{ShutdownSignal, clamp_exit_code, exit_code_value};
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
+
+    #[test]
+    fn shutdown_signals_map_to_shell_exit_codes() {
+        assert_eq!(ShutdownSignal::Interrupt.exit_code(), 130);
+        assert_eq!(ShutdownSignal::Terminate.exit_code(), 143);
+    }
 
     #[test]
     fn normal_exit_codes_are_preserved() {
