@@ -6,13 +6,12 @@ on:
       - 'v*-hb.*'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   release:
     name: macOS arm64 release
     runs-on: macos-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -20,17 +19,22 @@ jobs:
         run: brew install protobuf cmake
 
       - name: Update Rust toolchain
-        run: rustup update stable
+        id: rust
+        run: |
+          rustup update stable
+          echo "rustc_version=$(rustc -V)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-${{ steps.rust.outputs.rustc_version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ steps.rust.outputs.rustc_version }}-
+            ${{ runner.os }}-cargo-release-
 
       - name: Build
         run: cargo build --release --locked -p xodus-cli -p xodus-service
@@ -62,9 +66,9 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
 
       - name: Sign binaries
         env:
@@ -75,7 +79,9 @@ jobs:
           for bin in target/release/xodus-cli target/release/xodus-service; do
             if [ "$SIGNING_ENABLED" = "true" ]; then
               echo "Signing $bin with the configured identity"
-              codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$bin"
+              codesign --force --options runtime --timestamp \
+                --entitlements packaging/macos/xodus.entitlements \
+                --sign "$MACOS_SIGNING_IDENTITY" "$bin"
             else
               echo "Signing $bin ad-hoc (no signing secrets configured)"
               codesign --force --sign - "$bin"
@@ -90,10 +96,15 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            TAG="$COMMIT_SHA"
+            TAG="dev-${COMMIT_SHA:0:8}"
           else
             TAG="$REF_NAME"
+            if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-hb\.[0-9]+(-rc\.[0-9]+)?$'; then
+              echo "::error::Invalid release tag '$TAG'; expected v<major>.<minor>.<patch>-hb.<N> or v<major>.<minor>.<patch>-hb.<N>-rc.<M>"
+              exit 1
+            fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -131,16 +142,16 @@ jobs:
           path: dist/*
 
       - name: Create GitHub release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           args=(--title "Xodus $TAG" --generate-notes)
-          case "$TAG" in
-            *-rc*) args+=(--prerelease) ;;
-          esac
+          if printf '%s' "$TAG" | grep -q -- '-rc\.'; then
+            args+=(--prerelease)
+          fi
           gh release create "$TAG" dist/* "${args[@]}"
 
       - name: Clean up keychain

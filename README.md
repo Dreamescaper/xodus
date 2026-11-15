@@ -125,7 +125,8 @@ Options:
 ## Releases for Highball
 
 Prebuilt macOS arm64 binaries are published from tags of the form
-`v<upstream crate version>-hb.<N>` (for example `v0.1.0-hb.1`). The
+`v<upstream crate version>-hb.<N>` (for example `v0.1.0-hb.1`), optionally
+with an `-rc.<M>` suffix (for example `v0.1.0-hb.1-rc.1`). The
 [release workflow](.github/workflows/release.yml) builds `xodus-cli` and
 `xodus-service` and attaches the following assets:
 
@@ -135,9 +136,14 @@ Prebuilt macOS arm64 binaries are published from tags of the form
 - `xodus-<tag>-source.tar.gz` – source tarball (`git archive` of the tag)
 - `SHA256SUMS` – SHA-256 checksums for every published file
 
-Tags containing `-rc` are published as prereleases. Manual runs of the
+Tags containing `-rc.` are published as prereleases. Manual runs of the
 workflow only build and upload a workflow artifact; they do not create a
 release.
+
+Re-running a release for the same tag changes signatures (and therefore the
+SHA-256 values), so a published release must never be re-created for the same
+tag. Consumers should pin the SHA-256 values from the published
+`SHA256SUMS`.
 
 Code signing is optional. Set the repository secrets
 `MACOS_CERTIFICATE_P12` (base64-encoded `.p12`), `MACOS_CERTIFICATE_PASSWORD`
