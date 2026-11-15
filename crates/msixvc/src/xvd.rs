@@ -29,6 +29,7 @@ use crate::models::xvd::{
     XvdSegmentMetadataSegment, XvdSegmentMetadataSegmentFlags, XvdUserDataHeader,
     XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
 };
+use crate::streaming::TransferControl;
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
 
 pub(crate) const MAX_RECONNECT_ATTEMPTS: usize = 5;
@@ -375,6 +376,10 @@ fn content_range_matches(
         return false;
     };
     start == expected_start && last >= start && last <= requested_end && total == expected_total
+}
+
+fn stopped_transfer() -> io::Error {
+    io::Error::new(ErrorKind::Interrupted, "streaming transfer stopped")
 }
 
 async fn checkpoint_if_needed<Checkpoint>(
@@ -967,6 +972,7 @@ impl XvdFile {
         sfile: &SegmentFile,
         full_key: [u8; 32],
         mut progress: Progress,
+        mut control: Option<tokio::sync::watch::Receiver<TransferControl>>,
         resume_offset: u64,
         mut checkpoint: Checkpoint,
         preferred_host: Arc<AtomicUsize>,
@@ -1051,10 +1057,84 @@ impl XvdFile {
             if page_in_section >= page_start + page_count || remaining == 0 {
                 break;
             }
+
+            if let Some(receiver) = control.as_mut() {
+                let state = *receiver.borrow();
+                match state {
+                    TransferControl::Paused => {
+                        // Commit everything written so far, release the range
+                        // request, and wait. On resume a fresh request starts at
+                        // `v`; `pending` holds the unaligned tail so the next
+                        // HTTP range can continue exactly where it left off.
+                        out.flush().await?;
+                        checkpoint_if_needed(&mut checkpoint, sfile.length - remaining).await?;
+                        last_checkpoint = sfile.length - remaining;
+                        drop(stream.take());
+                        loop {
+                            if receiver.changed().await.is_err() {
+                                // The controller disappeared: never leave the
+                                // transfer parked forever (stdin EOF guard).
+                                break;
+                            }
+                            let state = *receiver.borrow();
+                            match state {
+                                TransferControl::Paused => {}
+                                TransferControl::Running => break,
+                                TransferControl::Stop => {
+                                    out.flush().await?;
+                                    checkpoint_if_needed(&mut checkpoint, sfile.length - remaining)
+                                        .await?;
+                                    return Err(stopped_transfer().into());
+                                }
+                            }
+                        }
+                        // A resume starts a fresh failure budget.
+                        reconnect_attempts = 0;
+                        stream = open_segment_stream(
+                            client,
+                            &urls[url_index],
+                            sfile.offset + v,
+                            sfile.offset + page_length - 1,
+                            expected_total,
+                            stall_timeout,
+                        )
+                        .await;
+                        continue;
+                    }
+                    TransferControl::Stop => {
+                        out.flush().await?;
+                        checkpoint_if_needed(&mut checkpoint, sfile.length - remaining).await?;
+                        return Err(stopped_transfer().into());
+                    }
+                    TransferControl::Running => {}
+                }
+            }
+
+            let mut control_lost = false;
             let next = if let Some(s) = stream.as_mut() {
-                timeout(stall_timeout, s.next()).await
+                if let Some(receiver) = control.as_mut() {
+                    tokio::select! {
+                        biased;
+                        changed = receiver.changed() => {
+                            if changed.is_err() {
+                                control_lost = true;
+                            }
+                            None
+                        }
+                        next = timeout(stall_timeout, s.next()) => Some(next),
+                    }
+                } else {
+                    Some(timeout(stall_timeout, s.next()).await)
+                }
             } else {
-                Ok(None)
+                Some(Ok(None))
+            };
+            if control_lost {
+                control = None;
+                continue;
+            }
+            let Some(next) = next else {
+                continue;
             };
             let data = match next {
                 Ok(Some(Ok(data))) if !data.is_empty() => data,
@@ -1100,7 +1180,31 @@ impl XvdFile {
                     }
                     let backoff = reconnect_backoff(reconnect_attempts);
                     reconnect_attempts += 1;
-                    sleep(backoff).await;
+                    let mut control_lost = false;
+                    let mut control_changed = false;
+                    if let Some(receiver) = control.as_mut() {
+                        tokio::select! {
+                            biased;
+                            changed = receiver.changed() => {
+                                if changed.is_err() {
+                                    control_lost = true;
+                                }
+                                control_changed = true;
+                            }
+                            _ = sleep(backoff) => {}
+                        }
+                    } else {
+                        sleep(backoff).await;
+                    }
+                    if control_lost {
+                        control = None;
+                    }
+                    if control_changed {
+                        // Let the top of the loop park on pause or return on
+                        // stop; a resume reconnects with a fresh budget.
+                        drop(stream.take());
+                        continue;
+                    }
                     stream = open_segment_stream(
                         client,
                         &urls[url_index],
@@ -1433,6 +1537,7 @@ mod tests {
                 &test_segment(),
                 [0u8; 32],
                 |_, _| {},
+                None,
                 0,
                 |_| tokio::task::spawn_blocking(|| Ok(())),
                 Arc::new(AtomicUsize::new(0)),
@@ -1571,6 +1676,7 @@ mod tests {
                 segment,
                 [0u8; 32],
                 |_, _| {},
+                None,
                 0,
                 |_| tokio::task::spawn_blocking(|| Ok(())),
                 preferred_host,
@@ -1742,6 +1848,7 @@ mod tests {
                 &segment,
                 [0u8; 32],
                 |_, _| {},
+                None,
                 PAGE_SIZE as u64,
                 |_| tokio::task::spawn_blocking(|| Ok(())),
                 Arc::new(AtomicUsize::new(0)),

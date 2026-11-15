@@ -14,6 +14,19 @@ use crate::xvd::{MAX_RECONNECT_ATTEMPTS, reconnect_backoff};
 
 const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Pause/stop control for an in-flight HTTP segment transfer.
+///
+/// A paused transfer stops issuing HTTP reads, flushes what it has already
+/// committed and waits. A stopped transfer flushes and returns an interrupted
+/// error so the caller can leave a resumable journal behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransferControl {
+    #[default]
+    Running,
+    Paused,
+    Stop,
+}
+
 /// Stable digest used for package identity and durable download checkpoints.
 pub fn resume_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};

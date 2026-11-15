@@ -1,23 +1,32 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::vec;
 
 use fs2::available_space;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use msixvc::streaming;
+use msixvc::streaming::{self, TransferControl};
 use msixvc::xvd::{SegmentFile, XvdFile};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::watch;
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
 use crate::package::{SelectionOptions, get_content_id, get_packages};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProgressMode {
+    #[default]
+    Human,
+    Json,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamingOptions {
@@ -25,8 +34,11 @@ pub struct StreamingOptions {
     pub parallel: Option<usize>,
     pub market: Option<String>,
     pub selection: SelectionOptions,
+    pub progress: ProgressMode,
 }
 
+#[path = "streaming_progress.rs"]
+mod progress;
 #[path = "streaming_resume.rs"]
 mod resume;
 
@@ -36,11 +48,44 @@ struct Job {
 }
 
 enum ProgressEvent {
-    Started { id: usize, name: String, total: u64 },
-    Advanced { id: usize, delta: u64 },
-    Finished { id: usize },
-    UpdateRemaining { name: String, total: u64 },
-    UpdateStatus { name: String },
+    Started {
+        id: usize,
+        name: String,
+        total: u64,
+    },
+    /// Bytes restored from a checkpoint before new network reads begin.
+    Restored {
+        id: usize,
+        delta: u64,
+    },
+    Advanced {
+        id: usize,
+        delta: u64,
+    },
+    Finished {
+        id: usize,
+    },
+    UpdateRemaining {
+        name: String,
+        total: u64,
+    },
+    UpdateStatus {
+        name: String,
+    },
+    Planned {
+        total: u64,
+        saved: u64,
+        files: usize,
+    },
+    Paused {
+        paused: bool,
+    },
+    Failed {
+        kind: progress::FailureKind,
+        message: String,
+    },
+    Stopped,
+    Completed,
 }
 
 const PROGRESS_TEMPLATE: &str = "{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%";
@@ -83,6 +128,69 @@ fn progress_name(path: &str) -> String {
     format!("...{}", &path[start..])
 }
 
+fn stop_requested(control: &Option<watch::Receiver<TransferControl>>) -> bool {
+    control
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow() == TransferControl::Stop)
+}
+
+fn report_failure(progress_json: bool, kind: progress::FailureKind, message: &str) {
+    if progress_json {
+        progress::emit_error(kind, message);
+    }
+}
+
+fn report_error(progress_json: bool, error: &(dyn std::error::Error + 'static)) {
+    if progress_json {
+        let kind = progress::classify_failure(error);
+        progress::emit_error(kind, kind.message());
+    }
+}
+
+fn stopped_exit(progress_json: bool, exit_code: &AtomicI32) -> ExitCode {
+    if progress_json {
+        progress::emit_stopped();
+    }
+    let code = exit_code.load(Ordering::SeqCst);
+    let code = if code == 0 {
+        progress::STOP_EXIT_CODE
+    } else {
+        code
+    };
+    ExitCode::from(code as u8)
+}
+
+/// Run a pre-download phase until it finishes or a terminal Stop is requested.
+/// Stop/SIGINT/SIGTERM are therefore not swallowed by metadata or licensing.
+async fn until_stopped<F, T>(
+    control: &Option<watch::Receiver<TransferControl>>,
+    future: F,
+) -> Result<T, progress::StreamingFailure>
+where
+    F: Future<Output = T>,
+{
+    let Some(mut receiver) = control.as_ref().cloned() else {
+        return Ok(future.await);
+    };
+    if *receiver.borrow() == TransferControl::Stop {
+        return Err(progress::StreamingFailure::stopped());
+    }
+    tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if *receiver.borrow() == TransferControl::Stop {
+                    break;
+                }
+                if receiver.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => Err(progress::StreamingFailure::stopped()),
+        value = future => Ok(value),
+    }
+}
+
 pub async fn run(
     client: &reqwest::Client,
     tokens: &TokenManager,
@@ -94,15 +202,39 @@ pub async fn run(
         try_skip_ntfs,
         parallel,
         market,
-        selection,
+        mut selection,
+        progress: progress_mode,
     } = options;
+    let progress_json = progress_mode == ProgressMode::Json;
+    if progress_json {
+        // A JSON consumer cannot answer an interactive prompt either.
+        selection.non_interactive = true;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+    let exit_code = Arc::new(AtomicI32::new(0));
+    let (control_sender, control) =
+        progress::controls(progress_json, tx.clone(), exit_code.clone());
+    let control = if progress_json { Some(control) } else { None };
+    let report_control = if progress_json {
+        control_sender.clone()
+    } else {
+        None
+    };
+    if let Some(sender) = control_sender {
+        progress::install_signal_handlers(sender, exit_code.clone());
+    }
+
     if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
         let f = match File::open(fsrc).await {
             Ok(f) => f,
             Err(err) => {
                 eprintln!("could not open {fsrc}: {err}");
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Other,
+                    "could not open the streaming source",
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -110,6 +242,11 @@ pub async fn run(
             Ok(metadata) => metadata.len(),
             Err(err) => {
                 eprintln!("could not read metadata for {fsrc}: {err}");
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Other,
+                    "could not read the streaming source",
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -129,6 +266,10 @@ pub async fn run(
             l,
             tx,
             rx,
+            progress_json,
+            control,
+            report_control,
+            exit_code,
         )
         .await
     } else {
@@ -136,27 +277,50 @@ pub async fn run(
             vec![source]
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
-                let content_id_task =
-                    get_content_id(client, source, market.clone(), &selection).await;
+                let content_id_task = until_stopped(
+                    &control,
+                    get_content_id(client, source, market.clone(), &selection),
+                )
+                .await;
+                let content_id_task = match content_id_task {
+                    Err(_) => return stopped_exit(progress_json, &exit_code),
+                    Ok(task) => task,
+                };
                 let Ok(content_id) = content_id_task else {
                     let Err(err) = content_id_task else {
                         eprintln!("Unknown Error");
+                        report_failure(
+                            progress_json,
+                            progress::FailureKind::Other,
+                            "unknown error",
+                        );
                         return ExitCode::FAILURE;
                     };
-                    eprintln!("{}", err);
+                    eprintln!("{err}");
+                    report_error(progress_json, err.as_ref());
                     return ExitCode::FAILURE;
                 };
                 content_id
             } else {
                 source
             };
-            let package_result = get_packages(client, tokens, content_id.clone()).await;
+            let package_result =
+                until_stopped(&control, get_packages(client, tokens, content_id.clone())).await;
+            let package_result = match package_result {
+                Err(_) => return stopped_exit(progress_json, &exit_code),
+                Ok(task) => task,
+            };
             let Ok(package) = package_result else {
                 let Err(err) = package_result else {
                     eprintln!("Unknown Error");
+                    report_failure(progress_json, progress::FailureKind::Other, "unknown error");
                     return ExitCode::FAILURE;
                 };
                 eprintln!("{}", err);
+                if progress_json {
+                    let kind = progress::classify_failure(&err);
+                    progress::emit_error(kind, kind.message());
+                }
                 return ExitCode::FAILURE;
             };
             let Some(file) = package
@@ -165,22 +329,37 @@ pub async fn run(
                 .find(|p| p.file_name.ends_with(".msixvc"))
             else {
                 eprintln!("No .msixvc file found");
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Other,
+                    "the package has no streaming image",
+                );
                 return ExitCode::FAILURE;
             };
             let urls = file.download_urls();
             if urls.is_empty() {
                 eprintln!("The server returned no CDN for {}", file.file_name);
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Network,
+                    "the server returned no download host",
+                );
                 return ExitCode::FAILURE;
             }
             urls
         };
         let Some(first_url) = urls.first() else {
             eprintln!("The server returned no CDN for the package");
+            report_failure(
+                progress_json,
+                progress::FailureKind::Network,
+                "the server returned no download host",
+            );
             return ExitCode::FAILURE;
         };
         let mut pos = 0;
         let progress_tx = tx.clone();
-        let http_file = match streaming::HttpRead::open_urls(
+        let open = streaming::HttpRead::open_urls(
             client.clone(),
             urls.clone(),
             Some(move |c, _| {
@@ -194,15 +373,20 @@ pub async fn run(
                     pos = c;
                 }
             }),
-        )
-        .await
-        {
-            Ok(file) => file,
-            Err(err) => {
+        );
+        let http_file = match until_stopped(&control, open).await {
+            Err(_) => return stopped_exit(progress_json, &exit_code),
+            Ok(Ok(file)) => file,
+            Ok(Err(err)) => {
                 eprintln!(
                     "could not open streaming source {}: {}",
                     source_label(first_url),
                     err
+                );
+                report_failure(
+                    progress_json,
+                    progress::FailureKind::Network,
+                    "could not open the streaming source",
                 );
                 return ExitCode::FAILURE;
             }
@@ -224,6 +408,10 @@ pub async fn run(
             l,
             tx,
             rx,
+            progress_json,
+            control,
+            report_control,
+            exit_code,
         )
         .await
     }
@@ -244,11 +432,20 @@ async fn run_cli_reader<Reader>(
     expected_total: u64,
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
+    progress_json: bool,
+    control: Option<watch::Receiver<TransferControl>>,
+    report_control: Option<watch::Sender<TransferControl>>,
+    exit_code: Arc<AtomicI32>,
 ) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
-    let progress_task = tokio::spawn(async move {
+    let reporter_exit = exit_code.clone();
+    let reporter = tokio::spawn(async move {
+        if progress_json {
+            progress::report(rx, report_control, reporter_exit).await;
+            return;
+        }
         let multi_progress = MultiProgress::new();
         let total_progess = multi_progress.add(ProgressBar::new(l).with_style(progress_style()));
 
@@ -263,7 +460,7 @@ where
                     cur_progess.set_message(name);
                     bars.insert(id, cur_progess);
                 }
-                ProgressEvent::Advanced { id, delta } => {
+                ProgressEvent::Restored { id, delta } | ProgressEvent::Advanced { id, delta } => {
                     if let Some(bar) = bars.get(&id) {
                         bar.inc(delta);
                     }
@@ -281,12 +478,19 @@ where
                 ProgressEvent::UpdateStatus { name } => {
                     total_progess.set_message(name);
                 }
+                ProgressEvent::Planned { .. } => {}
+                ProgressEvent::Paused { paused } => {
+                    total_progess.set_message(if paused { "Paused" } else { "Downloading" });
+                }
+                ProgressEvent::Completed
+                | ProgressEvent::Failed { .. }
+                | ProgressEvent::Stopped => break,
             }
         }
 
         total_progess.abandon();
     });
-    let status = run_reader(
+    let outcome = run_reader(
         client,
         tokens,
         destination,
@@ -299,10 +503,36 @@ where
         preferred_host,
         expected_total,
         &tx,
+        control,
     )
     .await;
+    let status = match outcome {
+        Ok(()) => {
+            tx.send(ProgressEvent::Completed).await.ok();
+            ExitCode::SUCCESS
+        }
+        Err(failure) if failure.kind == progress::FailureKind::Stopped => {
+            tx.send(ProgressEvent::Stopped).await.ok();
+            let code = exit_code.load(Ordering::SeqCst);
+            let code = if code == 0 {
+                progress::STOP_EXIT_CODE
+            } else {
+                code
+            };
+            ExitCode::from(code as u8)
+        }
+        Err(failure) => {
+            tx.send(ProgressEvent::Failed {
+                kind: failure.kind,
+                message: failure.message,
+            })
+            .await
+            .ok();
+            ExitCode::FAILURE
+        }
+    };
     drop(tx);
-    let _ = progress_task.await;
+    let _ = reporter.await;
     status
 }
 
@@ -320,73 +550,108 @@ async fn run_reader<Reader>(
     preferred_host: Arc<AtomicUsize>,
     expected_total: u64,
     tx: &Sender<ProgressEvent>,
-) -> ExitCode
+    control: Option<watch::Receiver<TransferControl>>,
+) -> Result<(), progress::StreamingFailure>
 where
     Reader: AsyncRead + Unpin,
 {
     let out: &Path = Path::new(&destination);
     let source_url = urls.first().map(String::as_str).unwrap_or("<unknown>");
 
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
+
     if let Err(err) = std::fs::create_dir_all(out) {
         eprintln!("could not create destination {}: {err}", out.display());
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "could not create the destination folder",
+        ));
     }
 
     let _folder_lock = match resume::lock(out) {
         Ok(lock) => lock,
         Err(err) => {
             eprintln!("cannot start this download: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "another download is using the destination folder",
+            ));
         }
     };
 
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
 
-    let mut remote_file = match streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await
+    let mut remote_file = match until_stopped(
+        &control,
+        streaming::PrefixCacheFile::new(reader, l, cache_path.clone()),
+    )
+    .await
     {
-        Ok(file) => file,
-        Err(err) => {
+        Err(failure) => return Err(failure),
+        Ok(Ok(file)) => file,
+        Ok(Err(err)) => {
             eprintln!(
                 "could not create streaming cache {}: {err}",
                 cache_path.display()
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not create the streaming cache",
+            ));
         }
     };
-    let remote_xvd = match XvdFile::parse(&mut remote_file).await {
-        Ok(xvd) => xvd,
-        Err(error) => {
+    let remote_xvd = match until_stopped(&control, XvdFile::parse(&mut remote_file)).await {
+        Err(failure) => return Err(failure),
+        Ok(Ok(xvd)) => xvd,
+        Ok(Err(error)) => {
             eprintln!(
                 "could not parse streaming package from {}: {error}",
                 source_label(source_url)
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not read the streaming package",
+            ));
         }
     };
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
-    let files = match remote_xvd.parse_user_package_files(&mut remote_file).await {
-        Ok(files) => files,
-        Err(error) => {
+    let files = match until_stopped(
+        &control,
+        remote_xvd.parse_user_package_files(&mut remote_file),
+    )
+    .await
+    {
+        Err(failure) => return Err(failure),
+        Ok(Ok(files)) => files,
+        Ok(Err(error)) => {
             eprintln!(
                 "could not read the package file list from {}: {error}",
                 source_label(source_url)
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not read the package file list",
+            ));
         }
     };
     for (k, v) in &files {
         if k == "SegmentMetadata.bin" {
-            let sfiles = match remote_xvd.parse_segment_metadata(&mut remote_file, v).await {
-                Ok(files) => files,
-                Err(error) => {
+            let sfiles = match until_stopped(
+                &control,
+                remote_xvd.parse_segment_metadata(&mut remote_file, v),
+            )
+            .await
+            {
+                Err(failure) => return Err(failure),
+                Ok(Ok(files)) => files,
+                Ok(Err(error)) => {
                     eprintln!(
                         "could not read {k} from {}: {error}",
                         source_label(source_url)
                     );
-                    return ExitCode::FAILURE;
+                    return Err(progress::StreamingFailure::other(
+                        "could not read the package metadata",
+                    ));
                 }
             };
             rfiles = sfiles;
@@ -399,17 +664,22 @@ where
         })
         .await
         .ok();
-        let sfiles = match remote_xvd
-            .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
-            .await
+        let sfiles = match until_stopped(
+            &control,
+            remote_xvd.parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty()),
+        )
+        .await
         {
-            Ok(files) => files,
-            Err(error) => {
+            Err(failure) => return Err(failure),
+            Ok(Ok(files)) => files,
+            Ok(Err(error)) => {
                 eprintln!(
                     "could not read NTFS metadata from {}: {error}",
                     source_label(source_url)
                 );
-                return ExitCode::FAILURE;
+                return Err(progress::StreamingFailure::other(
+                    "could not read the NTFS metadata",
+                ));
             }
         };
         rfiles.extend(sfiles);
@@ -422,60 +692,86 @@ where
         .ok();
 
     if let Some(mut file) = file {
-        let xvd = match XvdFile::parse(&mut file).await {
-            Ok(xvd) => xvd,
-            Err(error) => {
+        let xvd = match until_stopped(&control, XvdFile::parse(&mut file)).await {
+            Err(failure) => return Err(failure),
+            Ok(Ok(xvd)) => xvd,
+            Ok(Err(error)) => {
                 eprintln!(
                     "could not parse existing package {}: {error}",
                     final_path.display()
                 );
-                return ExitCode::FAILURE;
+                return Err(progress::StreamingFailure::other(
+                    "could not read the existing package",
+                ));
             }
         };
 
-        let files = match xvd.parse_user_package_files(&mut file).await {
-            Ok(files) => files,
-            Err(error) => {
+        let files = match until_stopped(&control, xvd.parse_user_package_files(&mut file)).await {
+            Err(failure) => return Err(failure),
+            Ok(Ok(files)) => files,
+            Ok(Err(error)) => {
                 eprintln!(
                     "could not read the package file list from {}: {error}",
                     final_path.display()
                 );
-                return ExitCode::FAILURE;
+                return Err(progress::StreamingFailure::other(
+                    "could not read the existing package file list",
+                ));
             }
         };
         for (k, v) in &files {
             if k == "SegmentMetadata.bin" {
-                let sfiles = match xvd.parse_segment_metadata(&mut file, v).await {
-                    Ok(files) => files,
-                    Err(error) => {
-                        eprintln!("could not read {k} from {}: {error}", final_path.display());
-                        return ExitCode::FAILURE;
-                    }
-                };
+                let sfiles =
+                    match until_stopped(&control, xvd.parse_segment_metadata(&mut file, v)).await {
+                        Err(failure) => return Err(failure),
+                        Ok(Ok(files)) => files,
+                        Ok(Err(error)) => {
+                            eprintln!("could not read {k} from {}: {error}", final_path.display());
+                            return Err(progress::StreamingFailure::other(
+                                "could not read the existing package metadata",
+                            ));
+                        }
+                    };
                 lfiles = sfiles;
             }
         }
 
-        if let Ok(sfiles) = xvd
-            .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
-            .await
+        match until_stopped(
+            &control,
+            xvd.parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty()),
+        )
+        .await
         {
-            lfiles.extend(sfiles);
+            Err(failure) => return Err(failure),
+            Ok(Ok(sfiles)) => lfiles.extend(sfiles),
+            Ok(Err(_)) => {}
         }
     }
 
-    let license = get_license(
-        client,
-        tokens,
-        remote_xvd.content_id().to_string(),
-        market.unwrap_or("neutral".to_string()),
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
+    tx.send(ProgressEvent::UpdateStatus {
+        name: "Licensing".to_owned(),
+    })
+    .await
+    .ok();
+    let license = until_stopped(
+        &control,
+        get_license(
+            client,
+            tokens,
+            remote_xvd.content_id().to_string(),
+            market.unwrap_or("neutral".to_string()),
+        ),
     )
     .await;
     let (key, game_splicense) = match license {
-        Ok(license) => license,
-        Err(err) => {
+        Err(failure) => return Err(failure),
+        Ok(Ok(license)) => license,
+        Ok(Err(err)) => {
             eprintln!("{err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::from_command(err));
         }
     };
     if game_splicense.content_keys.len() != 1 {
@@ -483,10 +779,14 @@ where
             "unexpected number of content keys {}",
             game_splicense.content_keys.len()
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "the package license has an unexpected content key count",
+        ));
     }
     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "the package license has no content key",
+        ));
     };
 
     let full_key = match content_key.unpack(&key) {
@@ -496,7 +796,9 @@ where
                 "could not unpack the content key for {}: {err}",
                 remote_xvd.content_id()
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not unpack the package content key",
+            ));
         }
     };
 
@@ -504,14 +806,18 @@ where
         Ok(identity) => identity,
         Err(err) => {
             eprintln!("could not prepare download checkpoints: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not prepare download checkpoints",
+            ));
         }
     };
     let journal = match resume::Journal::open_with_identity(out, &identity) {
         Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
         Err(err) => {
             eprintln!("could not open download checkpoints: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not open download checkpoints",
+            ));
         }
     };
 
@@ -541,22 +847,28 @@ where
         .map(|job| (job.name.clone(), job.content.length))
         .collect();
     let journal_for_offsets = journal.clone();
-    let offsets = match tokio::task::spawn_blocking(move || {
-        let journal = journal_for_offsets.lock().expect("journal lock poisoned");
-        offset_requests
-            .into_iter()
-            .map(|(name, length)| {
-                let offset = journal.offset(&name, length);
-                (name, offset)
-            })
-            .collect::<HashMap<String, u64>>()
-    })
+    let offsets = match until_stopped(
+        &control,
+        tokio::task::spawn_blocking(move || {
+            let journal = journal_for_offsets.lock().expect("journal lock poisoned");
+            offset_requests
+                .into_iter()
+                .map(|(name, length)| {
+                    let offset = journal.offset(&name, length);
+                    (name, offset)
+                })
+                .collect::<HashMap<String, u64>>()
+        }),
+    )
     .await
     {
-        Ok(offsets) => offsets,
-        Err(err) => {
+        Err(failure) => return Err(failure),
+        Ok(Ok(offsets)) => offsets,
+        Ok(Err(err)) => {
             eprintln!("could not read download checkpoints: {err}");
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not read download checkpoints",
+            ));
         }
     };
     let saved: u64 = offsets.values().sum();
@@ -570,7 +882,9 @@ where
                 out.display(),
                 err
             );
-            return ExitCode::FAILURE;
+            return Err(progress::StreamingFailure::other(
+                "could not determine the available disk space",
+            ));
         }
     };
 
@@ -582,9 +896,21 @@ where
             available_free_space,
             total_size
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "not enough free disk space for the package",
+        ));
     }
 
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
+    tx.send(ProgressEvent::Planned {
+        total: total_size,
+        saved,
+        files: jobs.len(),
+    })
+    .await
+    .ok();
     tx.send(ProgressEvent::UpdateRemaining {
         name: "Downloading".to_owned(),
         total: total_size,
@@ -603,17 +929,20 @@ where
             "could not remove previous streaming package {}: {err}",
             final_path.display()
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "could not remove the previous streaming package",
+        ));
     }
 
     let segments = stream::iter(jobs)
         .enumerate()
-        .map(Ok::<_, String>)
+        .map(Ok::<_, progress::StreamingFailure>)
         .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
             let tx = tx.clone();
             let client = client.clone();
             let journal = journal.clone();
             let preferred_host = preferred_host.clone();
+            let control = control.clone();
             let offsets = &offsets;
             async move {
                 download_segment(
@@ -627,6 +956,7 @@ where
                     full_key,
                     offsets,
                     journal,
+                    control,
                     preferred_host,
                     expected_total,
                 )
@@ -635,11 +965,16 @@ where
         })
         .await;
 
-    if let Err(err) = segments {
-        eprintln!("{err}");
-        return ExitCode::FAILURE;
-    }
+    segments?;
 
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
+    tx.send(ProgressEvent::UpdateStatus {
+        name: "Finalizing".to_owned(),
+    })
+    .await
+    .ok();
     std::fs::remove_file(&final_path).ok();
     if let Err(err) = std::fs::rename(&cache_path, &final_path) {
         eprintln!(
@@ -647,21 +982,22 @@ where
             cache_path.display(),
             final_path.display()
         );
-        return ExitCode::FAILURE;
+        return Err(progress::StreamingFailure::other(
+            "could not finalize the streaming package",
+        ));
     }
     let _ = std::fs::remove_file(out.join(resume::JOURNAL_FILE));
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 async fn checkpoint_blocking(
     journal: Arc<std::sync::Mutex<resume::Journal>>,
     name: String,
     offset: u64,
-) -> Result<(), String> {
+) -> Result<(), progress::StreamingFailure> {
     if offset == 0 {
         return Ok(());
     }
-    let label = name.clone();
     tokio::task::spawn_blocking(move || {
         journal
             .lock()
@@ -669,8 +1005,14 @@ async fn checkpoint_blocking(
             .checkpoint(&name, offset)
     })
     .await
-    .map_err(|err| format!("checkpoint task failed for {label}: {err}"))?
-    .map_err(|err| format!("could not checkpoint segment {label}: {err}"))
+    .map_err(|err| {
+        eprintln!("download checkpoint task failed: {err}");
+        progress::StreamingFailure::other("could not save a download checkpoint")
+    })?
+    .map_err(|err| {
+        eprintln!("could not save a download checkpoint: {err}");
+        progress::StreamingFailure::other("could not save a download checkpoint")
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -685,19 +1027,33 @@ async fn download_segment(
     full_key: [u8; 32],
     offsets: &HashMap<String, u64>,
     journal: Arc<std::sync::Mutex<resume::Journal>>,
+    control: Option<watch::Receiver<TransferControl>>,
     preferred_host: Arc<AtomicUsize>,
     expected_total: u64,
-) -> Result<(), String> {
+) -> Result<(), progress::StreamingFailure> {
+    if stop_requested(&control) {
+        return Err(progress::StreamingFailure::stopped());
+    }
     let url = urls.first().map(String::as_str).unwrap_or("<unknown>");
-    let target_file = resume::target(out, &job.name)
-        .map_err(|err| format!("invalid segment path {}: {err}", job.name))?;
+    let target_file = match resume::target(out, &job.name) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("invalid segment path {}: {err}", job.name);
+            return Err(progress::StreamingFailure::other(
+                "invalid package file path",
+            ));
+        }
+    };
     if let Some(folder) = target_file.parent()
         && let Err(err) = std::fs::create_dir_all(folder)
     {
-        return Err(format!(
+        eprintln!(
             "could not create directory {} for segment {}: {err}",
             folder.display(),
             job.name
+        );
+        return Err(progress::StreamingFailure::other(
+            "could not create a package folder",
         ));
     }
     let mut fout = match OpenOptions::new()
@@ -709,10 +1065,13 @@ async fn download_segment(
     {
         Ok(file) => file,
         Err(err) => {
-            return Err(format!(
+            eprintln!(
                 "could not create {} for segment {}: {err}",
                 target_file.display(),
                 job.name
+            );
+            return Err(progress::StreamingFailure::other(
+                "could not create a package file",
             ));
         }
     };
@@ -724,10 +1083,13 @@ async fn download_segment(
     let offset = match resume::prepare_output(&mut fout, offset, &job.content).await {
         Ok(offset) => offset,
         Err(err) => {
-            return Err(format!(
+            eprintln!(
                 "could not prepare {} for segment {}: {err}",
                 target_file.display(),
                 job.name
+            );
+            return Err(progress::StreamingFailure::other(
+                "could not prepare a package file",
             ));
         }
     };
@@ -752,7 +1114,7 @@ async fn download_segment(
     })
     .await
     .ok();
-    tx.send(ProgressEvent::Advanced { id, delta: offset })
+    tx.send(ProgressEvent::Restored { id, delta: offset })
         .await
         .ok();
 
@@ -767,18 +1129,24 @@ async fn download_segment(
         let mut i = match File::open(fpath).await {
             Ok(file) => file,
             Err(err) => {
-                return Err(format!(
+                eprintln!(
                     "could not open source package {fpath} for segment {}: {err}",
                     job.name
+                );
+                return Err(progress::StreamingFailure::other(
+                    "could not open the local package source",
                 ));
             }
         };
         remote_xvd
             .extract_file(&mut i, &mut fout, &job.content, full_key, progress)
             .await
-            .map_err(|err| format!("could not extract segment {} from {fpath}: {err}", job.name))?;
+            .map_err(|err| {
+                eprintln!("could not extract segment {} from {fpath}: {err}", job.name);
+                progress::StreamingFailure::other("could not extract a package segment")
+            })?;
     } else {
-        remote_xvd
+        let result = remote_xvd
             .download_file_http(
                 client,
                 urls,
@@ -786,6 +1154,7 @@ async fn download_segment(
                 &job.content,
                 full_key,
                 progress,
+                control.clone(),
                 offset,
                 |position| {
                     let journal = journal.clone();
@@ -800,14 +1169,20 @@ async fn download_segment(
                 preferred_host,
                 expected_total,
             )
-            .await
-            .map_err(|err| {
-                format!(
-                    "could not download segment {} from {}: {err}",
-                    job.name,
-                    source_label(url)
-                )
-            })?;
+            .await;
+        if let Err(err) = result {
+            if stop_requested(&control) {
+                return Err(progress::StreamingFailure::stopped());
+            }
+            eprintln!(
+                "could not download segment {} from {}: {err}",
+                job.name,
+                source_label(url)
+            );
+            return Err(progress::StreamingFailure::network(
+                "could not download a package segment",
+            ));
+        }
     }
     tx.send(ProgressEvent::Finished { id }).await.ok();
     Ok(())
@@ -833,6 +1208,33 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_pre_download_phase_and_completion_is_unchanged() {
+        let (tx, rx) = watch::channel(TransferControl::Running);
+        let control = Some(rx);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tx.send(TransferControl::Stop).ok();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            until_stopped(&control, std::future::pending::<()>()),
+        )
+        .await
+        .expect("stop must cancel a slow pre-download phase");
+        assert!(result.is_err());
+        stopper.await.unwrap();
+
+        let (tx, rx) = watch::channel(TransferControl::Running);
+        let control = Some(rx);
+        assert_eq!(
+            until_stopped(&control, async { 42 }).await.unwrap(),
+            42,
+            "a running transfer returns the phase result"
+        );
+        drop(tx);
     }
 
     #[test]
