@@ -8,8 +8,48 @@ use futures_util::Stream;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+use tokio::time::sleep;
+
+use crate::xvd::{MAX_RECONNECT_ATTEMPTS, reconnect_backoff};
 
 const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Stable digest used for package identity and durable download checkpoints.
+pub fn resume_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Incremental checkpoint identity digest. Callers can serialize large layouts
+/// through a bounded buffer instead of materializing their entire JSON encoding.
+#[derive(Default)]
+pub struct ResumeDigest(sha2::Sha256);
+
+impl std::io::Write for ResumeDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ResumeDigest {
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        self.0
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 type PendingHttpOpen = Pin<Box<dyn Future<Output = std::io::Result<OpenedHttpStream>> + Send>>;
@@ -28,7 +68,8 @@ struct OpenedHttpStream {
 
 pub struct HttpRead<'t> {
     client: reqwest::Client,
-    url: String,
+    urls: Vec<String>,
+    url_index: usize,
     len: u64,
     pos: u64,
     pending_open: Option<PendingHttpOpen>,
@@ -47,28 +88,67 @@ impl<'t> HttpRead<'t> {
     where
         Progress: FnMut(u64, u64) + Send + 't,
     {
-        let url = url.into();
-        let initial = open_http_stream(client.clone(), url.clone(), None).await?;
+        Self::open_urls(client, vec![url.into()], progress).await
+    }
 
-        Ok(Self {
-            client,
-            url,
-            len: initial.len,
-            pos: 0,
-            pending_open: None,
-            active: Some(ActiveHttpStream {
-                next_offset: initial.start,
-                end_offset: initial.len,
-                stream: initial.stream,
-            }),
-            pending_chunk: None,
-            pending_chunk_offset: 0,
-            progress: progress.map(|v| Box::new(v) as Box<dyn FnMut(u64, u64) + Send + 't>),
-        })
+    /// Open the package from the first URL that works. Later reconnects move
+    /// to the next URL instead of reopening a host that already failed.
+    pub async fn open_urls<Progress>(
+        client: reqwest::Client,
+        urls: Vec<String>,
+        progress: Option<Progress>,
+    ) -> std::io::Result<Self>
+    where
+        Progress: FnMut(u64, u64) + Send + 't,
+    {
+        if urls.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "no package download URL was provided",
+            ));
+        }
+
+        let mut last_error = None;
+        for (url_index, url) in urls.iter().enumerate() {
+            match open_http_stream_with_retry(client.clone(), url.clone(), None, None).await {
+                Ok(initial) => {
+                    return Ok(Self {
+                        client,
+                        urls,
+                        url_index,
+                        len: initial.len,
+                        pos: 0,
+                        pending_open: None,
+                        active: Some(ActiveHttpStream {
+                            next_offset: initial.start,
+                            end_offset: initial.len,
+                            stream: initial.stream,
+                        }),
+                        pending_chunk: None,
+                        pending_chunk_offset: 0,
+                        progress: progress
+                            .map(|v| Box::new(v) as Box<dyn FnMut(u64, u64) + Send + 't>),
+                    });
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "no package download URL was provided",
+            )
+        }))
     }
 
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// Index of the URL this reader opened successfully.
+    pub fn url_index(&self) -> usize {
+        self.url_index
     }
 
     pub fn is_empty(&self) -> bool {
@@ -77,10 +157,11 @@ impl<'t> HttpRead<'t> {
 
     fn begin_open_stream(&mut self, start: u64) {
         let client = self.client.clone();
-        let url = self.url.clone();
+        let url = self.urls[self.url_index].clone();
         let range_start = if start == 0 { None } else { Some(start) };
+        let expected_total = self.len;
         self.pending_open = Some(Box::pin(async move {
-            open_http_stream(client, url, range_start).await
+            open_http_stream_with_retry(client, url, range_start, Some(expected_total)).await
         }));
     }
 
@@ -88,27 +169,38 @@ impl<'t> HttpRead<'t> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if self.active.is_none() && self.pending_open.is_none() {
-            let pos = self.pos;
-            self.begin_open_stream(pos);
-        }
+        loop {
+            if self.active.is_none() && self.pending_open.is_none() {
+                let pos = self.pos;
+                self.begin_open_stream(pos);
+            }
 
-        let Some(fut) = self.pending_open.as_mut() else {
-            return Poll::Ready(Ok(()));
-        };
+            let Some(fut) = self.pending_open.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
 
-        match fut.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                self.pending_open = None;
-                let opened = result?;
-                self.len = opened.len;
-                self.active = Some(ActiveHttpStream {
-                    next_offset: opened.start,
-                    end_offset: opened.len,
-                    stream: opened.stream,
-                });
-                Poll::Ready(Ok(()))
+            match fut.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.pending_open = None;
+                    match result {
+                        Ok(opened) => {
+                            self.len = opened.len;
+                            self.active = Some(ActiveHttpStream {
+                                next_offset: opened.start,
+                                end_offset: opened.len,
+                                stream: opened.stream,
+                            });
+                            return Poll::Ready(Ok(()));
+                        }
+                        Err(err) => {
+                            if self.url_index + 1 >= self.urls.len() {
+                                return Poll::Ready(Err(err));
+                            }
+                            self.url_index += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -585,22 +677,70 @@ where
     }
 }
 
+enum HttpOpenError {
+    Retry(std::io::Error),
+    Fatal(std::io::Error),
+}
+
+impl From<std::io::Error> for HttpOpenError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Retry(err)
+    }
+}
+
+async fn open_http_stream_with_retry(
+    client: reqwest::Client,
+    url: String,
+    start: Option<u64>,
+    expected_total: Option<u64>,
+) -> std::io::Result<OpenedHttpStream> {
+    let mut attempt = 0usize;
+    loop {
+        let error = match open_http_stream(client.clone(), url.clone(), start).await {
+            Ok(opened) if expected_total.is_none_or(|expected| opened.len == expected) => {
+                return Ok(opened);
+            }
+            Ok(_) => Error::new(
+                ErrorKind::InvalidData,
+                "package length changed between download hosts",
+            ),
+            Err(HttpOpenError::Fatal(err)) => return Err(err),
+            Err(HttpOpenError::Retry(err)) => err,
+        };
+        if attempt >= MAX_RECONNECT_ATTEMPTS {
+            return Err(error);
+        }
+        sleep(reconnect_backoff(attempt)).await;
+        attempt += 1;
+    }
+}
+
 async fn open_http_stream(
     client: reqwest::Client,
     url: String,
     start: Option<u64>,
-) -> std::io::Result<OpenedHttpStream> {
+) -> Result<OpenedHttpStream, HttpOpenError> {
     let mut request = client.get(url);
     if let Some(start) = start {
         request = request.header(RANGE, format!("bytes={start}-"));
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(http_err)?
-        .error_for_status()
-        .map_err(http_err)?;
+    let response = request.send().await.map_err(http_err)?;
+    let status = response.status();
+    if !status.is_success() {
+        let error = response
+            .error_for_status()
+            .expect_err("a non-success status must produce an error");
+        let error = http_err(error);
+        // 408/429 and 5xx are transient; other 4xx statuses are final.
+        return Err(
+            if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+                HttpOpenError::Retry(error)
+            } else {
+                HttpOpenError::Fatal(error)
+            },
+        );
+    }
 
     let (actual_start, len) = match start {
         None => {
@@ -608,7 +748,8 @@ async fn open_http_stream(
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("expected 200 OK, got {}", response.status()),
-                ));
+                )
+                .into());
             }
             let len = response
                 .headers()
@@ -625,7 +766,8 @@ async fn open_http_stream(
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("expected 206 Partial Content, got {}", response.status()),
-                ));
+                )
+                .into());
             }
             let content_range = response
                 .headers()
@@ -649,7 +791,8 @@ async fn open_http_stream(
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("range resume mismatch: expected {expected_start}, got {actual_start}"),
-                ));
+                )
+                .into());
             }
             let len = total
                 .parse::<u64>()
@@ -898,6 +1041,88 @@ mod tests {
         assert!(!message.contains("secret"), "{message}");
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_read_opens_from_the_first_working_url() {
+        let body = test_body();
+
+        let failing = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failing_address = failing.local_addr().unwrap();
+        let failing_server = tokio::spawn(async move {
+            let (mut socket, _) = failing.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let working = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let working_address = working.local_addr().unwrap();
+        let working_body = body.clone();
+        let working_server = tokio::spawn(async move {
+            let (mut socket, _) = working.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                working_body.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(&working_body).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let mut file = HttpRead::open_urls(
+            reqwest::Client::new(),
+            vec![
+                format!("http://{failing_address}/file"),
+                format!("http://{working_address}/file"),
+            ],
+            Some(|_, _| {}),
+        )
+        .await
+        .expect("the second URL must open the package");
+
+        let mut read = vec![0u8; body.len()];
+        file.read_exact(&mut read).await.unwrap();
+        assert_eq!(read, body);
+
+        failing_server.await.unwrap();
+        working_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_read_rejects_a_different_package_total() {
+        let body = test_body();
+        let server = spawn_server(body.clone(), None, 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let opened =
+            super::open_http_stream_with_retry(client.clone(), server.url.clone(), None, None)
+                .await
+                .expect("the first open must record the package length");
+
+        let error = match super::open_http_stream_with_retry(
+            client,
+            server.url.clone(),
+            Some(0),
+            Some(opened.len + 1),
+        )
+        .await
+        {
+            Ok(_) => panic!("a host with another package length must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("package length changed"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

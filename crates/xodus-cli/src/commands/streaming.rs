@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::vec;
 
 use fs2::available_space;
@@ -16,6 +18,9 @@ use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
 use crate::package::{get_content_id, get_packages};
+
+#[path = "streaming_resume.rs"]
+mod resume;
 
 struct Job {
     name: String,
@@ -96,6 +101,8 @@ pub async fn run(
                 return ExitCode::FAILURE;
             }
         };
+        let urls = vec![source.clone()];
+        let preferred_host = Arc::new(AtomicUsize::new(0));
         run_cli_reader(
             client,
             tokens,
@@ -105,14 +112,16 @@ pub async fn run(
             market,
             f,
             l,
-            &source,
+            &urls,
+            preferred_host,
+            l,
             tx,
             rx,
         )
         .await
     } else {
-        let vurl = if source.starts_with("http://") || source.starts_with("https://") {
-            source
+        let urls: Vec<String> = if source.starts_with("http://") || source.starts_with("https://") {
+            vec![source]
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
                 let content_id_task = get_content_id(client, source, market.clone()).await;
@@ -145,18 +154,22 @@ pub async fn run(
                 eprintln!("No .msixvc file found");
                 return ExitCode::FAILURE;
             };
-            let Some(url) = file.download_urls().into_iter().next() else {
+            let urls = file.download_urls();
+            if urls.is_empty() {
                 eprintln!("The server returned no CDN for {}", file.file_name);
                 return ExitCode::FAILURE;
-            };
-            url
+            }
+            urls
         };
-        let url = &vurl;
+        let Some(first_url) = urls.first() else {
+            eprintln!("The server returned no CDN for the package");
+            return ExitCode::FAILURE;
+        };
         let mut pos = 0;
         let progress_tx = tx.clone();
-        let http_file = match streaming::HttpRead::open(
+        let http_file = match streaming::HttpRead::open_urls(
             client.clone(),
-            url,
+            urls.clone(),
             Some(move |c, _| {
                 if progress_tx
                     .try_send(ProgressEvent::Advanced {
@@ -175,13 +188,14 @@ pub async fn run(
             Err(err) => {
                 eprintln!(
                     "could not open streaming source {}: {}",
-                    source_label(url),
+                    source_label(first_url),
                     err
                 );
                 return ExitCode::FAILURE;
             }
         };
         let l = http_file.len();
+        let preferred_host = Arc::new(AtomicUsize::new(http_file.url_index()));
 
         run_cli_reader(
             client,
@@ -192,7 +206,9 @@ pub async fn run(
             market,
             http_file,
             l,
-            url,
+            &urls,
+            preferred_host,
+            l,
             tx,
             rx,
         )
@@ -210,7 +226,9 @@ async fn run_cli_reader<Reader>(
     market: Option<String>,
     reader: Reader,
     l: u64,
-    url: &str,
+    urls: &[String],
+    preferred_host: Arc<AtomicUsize>,
+    expected_total: u64,
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
 ) -> ExitCode
@@ -264,7 +282,9 @@ where
         market,
         reader,
         l,
-        url,
+        urls,
+        preferred_host,
+        expected_total,
         &tx,
     )
     .await;
@@ -283,18 +303,29 @@ async fn run_reader<Reader>(
     market: Option<String>,
     reader: Reader,
     l: u64,
-    url: &str,
+    urls: &[String],
+    preferred_host: Arc<AtomicUsize>,
+    expected_total: u64,
     tx: &Sender<ProgressEvent>,
 ) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
     let out: &Path = Path::new(&destination);
+    let source_url = urls.first().map(String::as_str).unwrap_or("<unknown>");
 
     if let Err(err) = std::fs::create_dir_all(out) {
         eprintln!("could not create destination {}: {err}", out.display());
         return ExitCode::FAILURE;
     }
+
+    let _folder_lock = match resume::lock(out) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("cannot start this download: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
@@ -315,7 +346,7 @@ where
         Err(error) => {
             eprintln!(
                 "could not parse streaming package from {}: {error}",
-                source_label(url)
+                source_label(source_url)
             );
             return ExitCode::FAILURE;
         }
@@ -328,7 +359,7 @@ where
         Err(error) => {
             eprintln!(
                 "could not read the package file list from {}: {error}",
-                source_label(url)
+                source_label(source_url)
             );
             return ExitCode::FAILURE;
         }
@@ -338,7 +369,10 @@ where
             let sfiles = match remote_xvd.parse_segment_metadata(&mut remote_file, v).await {
                 Ok(files) => files,
                 Err(error) => {
-                    eprintln!("could not read {k} from {}: {error}", source_label(url));
+                    eprintln!(
+                        "could not read {k} from {}: {error}",
+                        source_label(source_url)
+                    );
                     return ExitCode::FAILURE;
                 }
             };
@@ -360,7 +394,7 @@ where
             Err(error) => {
                 eprintln!(
                     "could not read NTFS metadata from {}: {error}",
-                    source_label(url)
+                    source_label(source_url)
                 );
                 return ExitCode::FAILURE;
             }
@@ -453,7 +487,22 @@ where
         }
     };
 
-    let total_size = rfiles
+    let identity = match resume::Journal::identity(&remote_xvd.resume_identity(), &rfiles) {
+        Ok(identity) => identity,
+        Err(err) => {
+            eprintln!("could not prepare download checkpoints: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let journal = match resume::Journal::open_with_identity(out, &identity) {
+        Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
+        Err(err) => {
+            eprintln!("could not open download checkpoints: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let jobs: Vec<Job> = rfiles
         .iter()
         .filter(|(k, v1)| {
             if let Some(v2) = lfiles.get(*k) {
@@ -462,10 +511,44 @@ where
                 true
             }
         })
-        .map(|(_, v)| v.length)
-        .sum();
+        .map(|(n, v)| Job {
+            name: n.clone(),
+            content: SegmentFile {
+                offset: v.offset,
+                length: v.length,
+                data_hashs: vec![],
+                keep_encrypted: v.keep_encrypted,
+            },
+        })
+        .collect();
 
-    let required_free_space = total_size;
+    let total_size: u64 = jobs.iter().map(|job| job.content.length).sum();
+    let offset_requests: Vec<(String, u64)> = jobs
+        .iter()
+        .map(|job| (job.name.clone(), job.content.length))
+        .collect();
+    let journal_for_offsets = journal.clone();
+    let offsets = match tokio::task::spawn_blocking(move || {
+        let journal = journal_for_offsets.lock().expect("journal lock poisoned");
+        offset_requests
+            .into_iter()
+            .map(|(name, length)| {
+                let offset = journal.offset(&name, length);
+                (name, offset)
+            })
+            .collect::<HashMap<String, u64>>()
+    })
+    .await
+    {
+        Ok(offsets) => offsets,
+        Err(err) => {
+            eprintln!("could not read download checkpoints: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let saved: u64 = offsets.values().sum();
+
+    let required_free_space = total_size.saturating_sub(saved);
     let available_free_space = match available_space(out) {
         Ok(space) => space,
         Err(err) => {
@@ -498,25 +581,6 @@ where
 
     let remote_xvd_ref = &remote_xvd;
     let full_key = *full_key;
-    let jobs: Vec<Job> = rfiles
-        .iter()
-        .filter(|(k, v1)| {
-            if let Some(v2) = lfiles.get(*k) {
-                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-            } else {
-                true
-            }
-        })
-        .map(|(n, v)| Job {
-            name: n.clone(),
-            content: SegmentFile {
-                offset: v.offset,
-                length: v.length,
-                data_hashs: vec![],
-                keep_encrypted: v.keep_encrypted,
-            },
-        })
-        .collect();
 
     if !jobs.is_empty()
         && let Err(err) = std::fs::remove_file(&final_path)
@@ -535,8 +599,25 @@ where
         .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
             let tx = tx.clone();
             let client = client.clone();
+            let journal = journal.clone();
+            let preferred_host = preferred_host.clone();
+            let offsets = &offsets;
             async move {
-                download_segment(remote_xvd_ref, &client, url, out, &job, id, &tx, full_key).await
+                download_segment(
+                    remote_xvd_ref,
+                    &client,
+                    urls,
+                    out,
+                    &job,
+                    id,
+                    &tx,
+                    full_key,
+                    offsets,
+                    journal,
+                    preferred_host,
+                    expected_total,
+                )
+                .await
             }
         })
         .await;
@@ -555,21 +636,48 @@ where
         );
         return ExitCode::FAILURE;
     }
+    let _ = std::fs::remove_file(out.join(resume::JOURNAL_FILE));
     ExitCode::SUCCESS
+}
+
+async fn checkpoint_blocking(
+    journal: Arc<std::sync::Mutex<resume::Journal>>,
+    name: String,
+    offset: u64,
+) -> Result<(), String> {
+    if offset == 0 {
+        return Ok(());
+    }
+    let label = name.clone();
+    tokio::task::spawn_blocking(move || {
+        journal
+            .lock()
+            .expect("journal lock poisoned")
+            .checkpoint(&name, offset)
+    })
+    .await
+    .map_err(|err| format!("checkpoint task failed for {label}: {err}"))?
+    .map_err(|err| format!("could not checkpoint segment {label}: {err}"))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
     remote_xvd: &XvdFile,
     client: &reqwest::Client,
-    url: &str,
+    urls: &[String],
     out: &Path,
     job: &Job,
     id: usize,
     tx: &Sender<ProgressEvent>,
     full_key: [u8; 32],
+    offsets: &HashMap<String, u64>,
+    journal: Arc<std::sync::Mutex<resume::Journal>>,
+    preferred_host: Arc<AtomicUsize>,
+    expected_total: u64,
 ) -> Result<(), String> {
-    let target_file = out.join(job.name.replace("\\", "/"));
+    let url = urls.first().map(String::as_str).unwrap_or("<unknown>");
+    let target_file = resume::target(out, &job.name)
+        .map_err(|err| format!("invalid segment path {}: {err}", job.name))?;
     if let Some(folder) = target_file.parent()
         && let Err(err) = std::fs::create_dir_all(folder)
     {
@@ -582,7 +690,7 @@ async fn download_segment(
     let mut fout = match OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(false)
         .open(&target_file)
         .await
     {
@@ -595,7 +703,22 @@ async fn download_segment(
             ));
         }
     };
-    let mut lp = 0;
+
+    let mut offset = offsets.get(&job.name).copied().unwrap_or(0);
+    if url.starts_with("file://") {
+        offset = 0;
+    }
+    let offset = match resume::prepare_output(&mut fout, offset, &job.content).await {
+        Ok(offset) => offset,
+        Err(err) => {
+            return Err(format!(
+                "could not prepare {} for segment {}: {err}",
+                target_file.display(),
+                job.name
+            ));
+        }
+    };
+    let mut lp = offset;
 
     let progress = |pos, _| {
         if tx
@@ -616,6 +739,16 @@ async fn download_segment(
     })
     .await
     .ok();
+    tx.send(ProgressEvent::Advanced { id, delta: offset })
+        .await
+        .ok();
+
+    if offset == job.content.length {
+        tx.send(ProgressEvent::Finished { id }).await.ok();
+        return Ok(());
+    }
+
+    checkpoint_blocking(journal.clone(), job.name.clone(), offset).await?;
 
     if let Some(fpath) = url.strip_prefix("file://") {
         let mut i = match File::open(fpath).await {
@@ -633,7 +766,27 @@ async fn download_segment(
             .map_err(|err| format!("could not extract segment {} from {fpath}: {err}", job.name))?;
     } else {
         remote_xvd
-            .download_file_http(client, url, &mut fout, &job.content, full_key, progress)
+            .download_file_http(
+                client,
+                urls,
+                &mut fout,
+                &job.content,
+                full_key,
+                progress,
+                offset,
+                |position| {
+                    let journal = journal.clone();
+                    let name = job.name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        journal
+                            .lock()
+                            .expect("journal lock poisoned")
+                            .checkpoint(&name, position)
+                    })
+                },
+                preferred_host,
+                expected_total,
+            )
             .await
             .map_err(|err| {
                 format!(
