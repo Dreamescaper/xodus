@@ -32,11 +32,26 @@ pub enum FileSelection {
     Prompt,
 }
 
-fn describe_files(files: &[String]) -> String {
+/// One package file offered to the user, with the size shown in launcher-facing errors when the
+/// server supplied a non-negative value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChoice {
+    pub name: String,
+    pub size: Option<u64>,
+}
+
+fn format_file_choices(files: &[FileChoice]) -> String {
     if files.is_empty() {
-        return "none".to_owned();
+        return "  (none)".to_owned();
     }
-    files.join(", ")
+    files
+        .iter()
+        .map(|file| match file.size {
+            Some(size) => format!("  {}\t{}", file.name, size),
+            None => format!("  {}", file.name),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Decide which package files to download without touching the terminal.
@@ -44,14 +59,14 @@ fn describe_files(files: &[String]) -> String {
 /// `interactive` says whether a prompt is allowed at all; the caller computes it from the global
 /// non-interactive switch plus terminal detection.
 pub fn choose_files(
-    files: &[String],
+    files: &[FileChoice],
     all_files: bool,
     requested: &[String],
     interactive: bool,
 ) -> Result<FileSelection, String> {
     if all_files {
         if files.is_empty() {
-            return Err("the package contains no files to download".to_owned());
+            return Err("error: the package contains no files to download".to_owned());
         }
         return Ok(FileSelection::Selected((0..files.len()).collect()));
     }
@@ -60,7 +75,7 @@ pub fn choose_files(
         let mut selected = Vec::new();
         let mut missing = Vec::new();
         for name in requested {
-            match files.iter().position(|file| file == name) {
+            match files.iter().position(|file| &file.name == name) {
                 Some(index) => {
                     if !selected.contains(&index) {
                         selected.push(index);
@@ -70,10 +85,11 @@ pub fn choose_files(
             }
         }
         if !missing.is_empty() {
+            let noun = if missing.len() == 1 { "file" } else { "files" };
             return Err(format!(
-                "unknown package file(s): {}; available files: {}",
+                "error: unknown package {noun} {}; valid values:\n{}",
                 missing.join(", "),
-                describe_files(files)
+                format_file_choices(files)
             ));
         }
         return Ok(FileSelection::Selected(selected));
@@ -84,8 +100,8 @@ pub fn choose_files(
     }
 
     Err(format!(
-        "no package files were selected; pass --all-files or --file <name>; available files: {}",
-        describe_files(files)
+        "error: file selection required; pass --all-files or --file <name>\n{}",
+        format_file_choices(files)
     ))
 }
 
@@ -495,12 +511,15 @@ pub async fn run(
     };
 
     let package_files = package.package_files;
-    let file_names: Vec<String> = package_files
+    let file_choices: Vec<FileChoice> = package_files
         .iter()
-        .map(|file| file.file_name.clone())
+        .map(|file| FileChoice {
+            name: file.file_name.clone(),
+            size: u64::try_from(file.file_size).ok(),
+        })
         .collect();
     let file_selection = match choose_files(
-        &file_names,
+        &file_choices,
         all_files,
         &requested_files,
         selection.prompt_allowed(),
@@ -591,7 +610,7 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{
-        FileSelection, choose_files, download_file, download_from_any, url_authority,
+        FileChoice, FileSelection, choose_files, download_file, download_from_any, url_authority,
         validate_file_name,
     };
 
@@ -1178,8 +1197,17 @@ mod tests {
         }
     }
 
-    fn files() -> Vec<String> {
-        vec!["a.msixvc".to_owned(), "b.xsp".to_owned()]
+    fn files() -> Vec<FileChoice> {
+        vec![
+            FileChoice {
+                name: "a.msixvc".to_owned(),
+                size: Some(123),
+            },
+            FileChoice {
+                name: "b.xsp".to_owned(),
+                size: None,
+            },
+        ]
     }
 
     #[test]
@@ -1208,11 +1236,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_file_lists_the_available_names() {
+    fn an_unknown_file_lists_choices_in_a_stable_layout() {
         let error = choose_files(&files(), false, &["missing.xsp".to_owned()], false).unwrap_err();
-        assert!(error.contains("missing.xsp"), "{error}");
-        assert!(error.contains("a.msixvc"), "{error}");
-        assert!(error.contains("b.xsp"), "{error}");
+        assert_eq!(
+            error,
+            "error: unknown package file missing.xsp; valid values:\n  a.msixvc\t123\n  b.xsp"
+        );
     }
 
     #[test]
@@ -1223,10 +1252,10 @@ mod tests {
         );
 
         let error = choose_files(&files(), false, &[], false).unwrap_err();
-        assert!(error.contains("--all-files"), "{error}");
-        assert!(error.contains("--file"), "{error}");
-        assert!(error.contains("a.msixvc"), "{error}");
-        assert!(error.contains("b.xsp"), "{error}");
+        assert_eq!(
+            error,
+            "error: file selection required; pass --all-files or --file <name>\n  a.msixvc\t123\n  b.xsp"
+        );
     }
 
     #[test]
