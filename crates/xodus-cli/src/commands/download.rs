@@ -500,6 +500,11 @@ pub async fn run(
         return ExitCode::FAILURE;
     };
 
+    if let Err(err) = crate::device::ensure(client, tokens).await {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
+
     let package_result = get_packages(client, tokens, content_id.clone()).await;
     let Ok(package) = package_result else {
         let Err(err) = package_result else {

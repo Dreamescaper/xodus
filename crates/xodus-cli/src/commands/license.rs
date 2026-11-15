@@ -13,6 +13,11 @@ pub async fn run(
     market: String,
     ciks: String,
 ) -> ExitCode {
+    if let Err(err) = crate::device::ensure(client, tokens).await {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
+
     let license = get_license(client, tokens, content_id, market).await;
     if let Err(err) = license {
         eprintln!("{}", err);

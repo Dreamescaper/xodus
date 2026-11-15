@@ -186,7 +186,7 @@ pub async fn do_sisu(
     Ok((auth, resp, data))
 }
 
-#[ignore]
+#[ignore = "contacts Microsoft (device registration); run with --ignored"]
 #[tokio::test]
 async fn test_minecraft_win_auth() {
     let client = reqwest::Client::new();

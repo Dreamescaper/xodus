@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
+use xodus::tokens::device::{DeviceError, DeviceErrorKind};
+
 #[derive(Debug)]
 pub enum CommandError {
     Auth {
@@ -81,6 +83,18 @@ impl Error for CommandError {
             | Self::Other { source, .. } => source
                 .as_ref()
                 .map(|source| source.as_ref() as &(dyn Error + 'static)),
+        }
+    }
+}
+
+impl From<DeviceError> for CommandError {
+    fn from(error: DeviceError) -> Self {
+        let kind = error.kind();
+        let message = error.to_string();
+        match kind {
+            DeviceErrorKind::Auth => Self::auth_from(message, error),
+            DeviceErrorKind::Network => Self::network_from(message, error),
+            DeviceErrorKind::Other => Self::other_from(message, error),
         }
     }
 }

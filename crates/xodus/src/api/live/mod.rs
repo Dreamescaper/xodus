@@ -137,12 +137,15 @@ mod test {
     use crate::tokens::TokenManager;
     use crate::tokens::device::ensure_device_credentials;
 
+    #[ignore = "contacts Microsoft (device registration); run with --ignored"]
     #[tokio::test]
     async fn test_get_xbox_live_dev_token() {
         let client = reqwest::Client::new();
 
         let mgr = TokenManager::with_memory();
-        ensure_device_credentials(&client, &mgr).await;
+        ensure_device_credentials(&client, &mgr)
+            .await
+            .expect("failed to provision device credentials");
 
         let token: Token = mgr.get_device_sts_token().unwrap();
         let Token::Legacy(token) = token else {
