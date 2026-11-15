@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*-hb.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: macOS arm64 release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: brew install protobuf cmake
+
+      - name: Update Rust toolchain
+        run: rustup update stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked -p xodus-cli -p xodus-service
+
+      - name: Check signing configuration
+        id: signing
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          if [ -n "$CERTIFICATE_P12" ] && [ -n "$CERTIFICATE_PASSWORD" ] && [ -n "$SIGNING_IDENTITY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD and/or MACOS_SIGNING_IDENTITY are not set; binaries will be ad-hoc signed."
+          fi
+
+      - name: Import signing certificate
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign binaries
+        env:
+          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          for bin in target/release/xodus-cli target/release/xodus-service; do
+            if [ "$SIGNING_ENABLED" = "true" ]; then
+              echo "Signing $bin with the configured identity"
+              codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$bin"
+            else
+              echo "Signing $bin ad-hoc (no signing secrets configured)"
+              codesign --force --sign - "$bin"
+            fi
+            codesign --verify --verbose "$bin"
+          done
+
+      - name: Determine tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$COMMIT_SHA"
+          else
+            TAG="$REF_NAME"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/xodus-${TAG}"
+          DIST="$PWD/dist"
+          mkdir -p "$STAGE" "$DIST"
+          cp target/release/xodus-cli target/release/xodus-service LICENSE "$STAGE/"
+
+          tar -czf "$DIST/xodus-${TAG}-macos-arm64.tar.gz" -C "$RUNNER_TEMP" "xodus-${TAG}"
+          git archive --format=tar.gz --prefix="xodus-${TAG}/" -o "$DIST/xodus-${TAG}-source.tar.gz" HEAD
+
+          cp target/release/xodus-cli "$DIST/xodus-cli-macos-arm64"
+          cp target/release/xodus-service "$DIST/xodus-service-macos-arm64"
+
+          (
+            cd "$DIST"
+            shasum -a 256 \
+              "xodus-${TAG}-macos-arm64.tar.gz" \
+              "xodus-${TAG}-source.tar.gz" \
+              "xodus-cli-macos-arm64" \
+              "xodus-service-macos-arm64" > SHA256SUMS
+            shasum -a 256 -c SHA256SUMS
+          )
+
+      - name: Upload workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: xodus-macos-arm64
+          path: dist/*
+
+      - name: Create GitHub release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          args=(--title "Xodus $TAG" --generate-notes)
+          case "$TAG" in
+            *-rc*) args+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" dist/* "${args[@]}"
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" >/dev/null 2>&1 || true
