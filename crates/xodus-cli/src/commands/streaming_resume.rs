@@ -444,7 +444,7 @@ mod tests {
         let result = xvd
             .download_file_http(
                 &client,
-                &failing.url,
+                std::slice::from_ref(&failing.url),
                 &mut output,
                 content,
                 [0; 32],
@@ -470,7 +470,7 @@ mod tests {
         let second = spawn_server(body.clone(), None, true).await;
         xvd.download_file_http(
             &client,
-            &second.url,
+            std::slice::from_ref(&second.url),
             &mut output,
             content,
             [0; 32],
@@ -487,7 +487,7 @@ mod tests {
         let complete = spawn_server(body.clone(), None, true).await;
         xvd.download_file_http(
             &client,
-            &complete.url,
+            std::slice::from_ref(&complete.url),
             &mut fresh,
             content,
             [0; 32],

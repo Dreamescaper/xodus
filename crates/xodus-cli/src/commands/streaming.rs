@@ -99,6 +99,7 @@ pub async fn run(
                 return ExitCode::FAILURE;
             }
         };
+        let urls = vec![source.clone()];
         run_cli_reader(
             client,
             tokens,
@@ -108,14 +109,14 @@ pub async fn run(
             market,
             f,
             l,
-            &source,
+            &urls,
             tx,
             rx,
         )
         .await
     } else {
-        let vurl = if source.starts_with("http://") || source.starts_with("https://") {
-            source
+        let urls: Vec<String> = if source.starts_with("http://") || source.starts_with("https://") {
+            vec![source]
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
                 let content_id_task = get_content_id(client, source, market.clone()).await;
@@ -148,18 +149,22 @@ pub async fn run(
                 eprintln!("No .msixvc file found");
                 return ExitCode::FAILURE;
             };
-            let Some(url) = file.download_urls().into_iter().next() else {
+            let urls = file.download_urls();
+            if urls.is_empty() {
                 eprintln!("The server returned no CDN for {}", file.file_name);
                 return ExitCode::FAILURE;
-            };
-            url
+            }
+            urls
         };
-        let url = &vurl;
+        let Some(first_url) = urls.first() else {
+            eprintln!("The server returned no CDN for the package");
+            return ExitCode::FAILURE;
+        };
         let mut pos = 0;
         let progress_tx = tx.clone();
-        let http_file = match streaming::HttpRead::open(
+        let http_file = match streaming::HttpRead::open_urls(
             client.clone(),
-            url,
+            urls.clone(),
             Some(move |c, _| {
                 if progress_tx
                     .try_send(ProgressEvent::Advanced {
@@ -178,7 +183,7 @@ pub async fn run(
             Err(err) => {
                 eprintln!(
                     "could not open streaming source {}: {}",
-                    source_label(url),
+                    source_label(first_url),
                     err
                 );
                 return ExitCode::FAILURE;
@@ -195,7 +200,7 @@ pub async fn run(
             market,
             http_file,
             l,
-            url,
+            &urls,
             tx,
             rx,
         )
@@ -213,7 +218,7 @@ async fn run_cli_reader<Reader>(
     market: Option<String>,
     reader: Reader,
     l: u64,
-    url: &str,
+    urls: &[String],
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
 ) -> ExitCode
@@ -267,7 +272,7 @@ where
         market,
         reader,
         l,
-        url,
+        urls,
         &tx,
     )
     .await;
@@ -286,13 +291,14 @@ async fn run_reader<Reader>(
     market: Option<String>,
     reader: Reader,
     l: u64,
-    url: &str,
+    urls: &[String],
     tx: &Sender<ProgressEvent>,
 ) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
     let out: &Path = Path::new(&destination);
+    let source_url = urls.first().map(String::as_str).unwrap_or("<unknown>");
 
     if let Err(err) = std::fs::create_dir_all(out) {
         eprintln!("could not create destination {}: {err}", out.display());
@@ -326,7 +332,7 @@ where
         Err(error) => {
             eprintln!(
                 "could not parse streaming package from {}: {error}",
-                source_label(url)
+                source_label(source_url)
             );
             return ExitCode::FAILURE;
         }
@@ -339,7 +345,7 @@ where
         Err(error) => {
             eprintln!(
                 "could not read the package file list from {}: {error}",
-                source_label(url)
+                source_label(source_url)
             );
             return ExitCode::FAILURE;
         }
@@ -349,7 +355,10 @@ where
             let sfiles = match remote_xvd.parse_segment_metadata(&mut remote_file, v).await {
                 Ok(files) => files,
                 Err(error) => {
-                    eprintln!("could not read {k} from {}: {error}", source_label(url));
+                    eprintln!(
+                        "could not read {k} from {}: {error}",
+                        source_label(source_url)
+                    );
                     return ExitCode::FAILURE;
                 }
             };
@@ -371,7 +380,7 @@ where
             Err(error) => {
                 eprintln!(
                     "could not read NTFS metadata from {}: {error}",
-                    source_label(url)
+                    source_label(source_url)
                 );
                 return ExitCode::FAILURE;
             }
@@ -566,7 +575,7 @@ where
                 download_segment(
                     remote_xvd_ref,
                     &client,
-                    url,
+                    urls,
                     out,
                     &job,
                     id,
@@ -600,7 +609,7 @@ where
 async fn download_segment(
     remote_xvd: &XvdFile,
     client: &reqwest::Client,
-    url: &str,
+    urls: &[String],
     out: &Path,
     job: &Job,
     id: usize,
@@ -608,6 +617,7 @@ async fn download_segment(
     full_key: [u8; 32],
     journal: &std::sync::Mutex<resume::Journal>,
 ) -> Result<(), String> {
+    let url = urls.first().map(String::as_str).unwrap_or("<unknown>");
     let target_file = resume::target(out, &job.name)
         .map_err(|err| format!("invalid segment path {}: {err}", job.name))?;
     if let Some(folder) = target_file.parent()
@@ -707,7 +717,7 @@ async fn download_segment(
         remote_xvd
             .download_file_http(
                 client,
-                url,
+                urls,
                 &mut fout,
                 &job.content,
                 full_key,
