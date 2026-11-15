@@ -335,6 +335,11 @@ pub async fn run(
         lfiles.extend(sfiles);
     }
 
+    if let Err(err) = crate::device::ensure(client, tokens).await {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
+
     let license = get_license(
         client,
         tokens,

@@ -11,6 +11,10 @@ const LOGIN_MARKET: &str = "en-US";
 const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0";
 
 pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
+    if let Err(err) = crate::device::ensure(client, tokens).await {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
     let token = tokens.get_device_sts_token().unwrap();
     let secrets::Token::Legacy(token) = token else {
         eprintln!("Invalid STS token");

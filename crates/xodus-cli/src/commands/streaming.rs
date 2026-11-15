@@ -210,6 +210,18 @@ pub async fn run(
         // A JSON consumer cannot answer an interactive prompt either.
         selection.non_interactive = true;
     }
+    // Resolve the destination before touching the network or provisioning a
+    // device: an unusable destination is a purely local failure.
+    let out = Path::new(&destination);
+    if let Err(err) = std::fs::create_dir_all(out) {
+        eprintln!("could not create destination {}: {err}", out.display());
+        report_failure(
+            progress_json,
+            progress::FailureKind::Other,
+            "could not create the destination folder",
+        );
+        return ExitCode::FAILURE;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
     let exit_code = Arc::new(AtomicI32::new(0));
     let (control_sender, control) =
@@ -255,6 +267,7 @@ pub async fn run(
         run_cli_reader(
             client,
             tokens,
+            false,
             destination,
             try_skip_ntfs,
             parallel,
@@ -304,6 +317,19 @@ pub async fn run(
             } else {
                 source
             };
+            let provisioned = until_stopped(&control, crate::device::ensure(client, tokens)).await;
+            let provisioned = match provisioned {
+                Err(_) => return stopped_exit(progress_json, &exit_code),
+                Ok(result) => result,
+            };
+            if let Err(err) = provisioned {
+                eprintln!("{err}");
+                if progress_json {
+                    let kind = progress::classify_failure(&err);
+                    progress::emit_error(kind, kind.message());
+                }
+                return ExitCode::FAILURE;
+            }
             let package_result =
                 until_stopped(&control, get_packages(client, tokens, content_id.clone())).await;
             let package_result = match package_result {
@@ -397,6 +423,7 @@ pub async fn run(
         run_cli_reader(
             client,
             tokens,
+            true,
             destination,
             try_skip_ntfs,
             parallel,
@@ -421,6 +448,7 @@ pub async fn run(
 async fn run_cli_reader<Reader>(
     client: &reqwest::Client,
     tokens: &TokenManager,
+    device_ready: bool,
     destination: String,
     try_skip_ntfs: bool,
     parallel: Option<usize>,
@@ -493,6 +521,7 @@ where
     let outcome = run_reader(
         client,
         tokens,
+        device_ready,
         destination,
         try_skip_ntfs,
         parallel,
@@ -540,6 +569,7 @@ where
 async fn run_reader<Reader>(
     client: &reqwest::Client,
     tokens: &TokenManager,
+    device_ready: bool,
     destination: String,
     try_skip_ntfs: bool,
     parallel: Option<usize>,
@@ -750,6 +780,17 @@ where
 
     if stop_requested(&control) {
         return Err(progress::StreamingFailure::stopped());
+    }
+    if !device_ready {
+        let provisioned = until_stopped(&control, crate::device::ensure(client, tokens)).await;
+        match provisioned {
+            Err(failure) => return Err(failure),
+            Ok(Err(err)) => {
+                eprintln!("{err}");
+                return Err(progress::StreamingFailure::from_command(err));
+            }
+            Ok(Ok(())) => {}
+        }
     }
     tx.send(ProgressEvent::UpdateStatus {
         name: "Licensing".to_owned(),

@@ -7,6 +7,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use xodus::tokens::TokenManager;
 
 mod commands;
+mod device;
 mod error;
 mod license;
 mod package;
@@ -213,24 +214,25 @@ async fn main() -> ExitCode {
     let args = CliArgs::parse();
     let non_interactive = args.non_interactive || env_flag("XODUS_NON_INTERACTIVE");
 
-    xodus::secrets::init_secrets().expect("Unable to initialize credentials");
+    // The secret store is initialised lazily on its first read/write, and device
+    // credentials are provisioned by each command right before it needs them.
+    // Purely local commands (clep, sp-license, logout, help/version) therefore
+    // never contact Microsoft or the keychain.
     let tokens = TokenManager::with_keychain_and_memory();
+    let code = dispatch(args.command, non_interactive, &client, &tokens).await;
 
-    // Clep/SpLicense are pure local data transforms and Logout only removes
-    // stored credentials - none of them need a device identity, so don't
-    // force provisioning (network + keychain access) just to run them. This
-    // matters in practice: on a session with no usable secret-service
-    // keychain, provisioning fails outright, which previously meant even
-    // these fully offline commands were unusable.
-    let needs_device_credentials = !matches!(
-        args.command,
-        SubCommand::Clep { .. } | SubCommand::SpLicense { .. } | SubCommand::Logout { .. }
-    );
-    if needs_device_credentials {
-        xodus::tokens::device::ensure_device_credentials(&client, &tokens).await;
-    }
+    xodus::secrets::destroy_secrets();
 
-    let code = match args.command {
+    code
+}
+
+async fn dispatch(
+    command: SubCommand,
+    non_interactive: bool,
+    client: &reqwest::Client,
+    tokens: &TokenManager,
+) -> ExitCode {
+    match command {
         SubCommand::Download {
             product,
             market,
@@ -249,7 +251,7 @@ async fn main() -> ExitCode {
                 all_files,
                 files,
             };
-            commands::download::run(&client, &tokens, product, options).await
+            commands::download::run(client, tokens, product, options).await
         }
         SubCommand::License {
             content_id,
@@ -257,24 +259,24 @@ async fn main() -> ExitCode {
             ciks,
         } => {
             commands::license::run(
-                &client,
-                &tokens,
+                client,
+                tokens,
                 content_id,
                 market.unwrap_or("neutral".to_string()),
                 ciks,
             )
             .await
         }
-        SubCommand::Login => commands::login::run(&client, &tokens).await,
-        SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
+        SubCommand::Login => commands::login::run(client, tokens).await,
+        SubCommand::Logout { device } => commands::logout::run(tokens, device).await,
         SubCommand::Extract {
             path,
             destination,
             market,
         } => {
             commands::extract::run(
-                &client,
-                &tokens,
+                client,
+                tokens,
                 path,
                 destination,
                 market.unwrap_or("neutral".to_string()),
@@ -305,7 +307,7 @@ async fn main() -> ExitCode {
                 },
                 progress,
             };
-            commands::streaming::run(&client, &tokens, source, destination, options).await
+            commands::streaming::run(client, tokens, source, destination, options).await
         }
         #[cfg(unix)]
         SubCommand::Run {
@@ -314,7 +316,7 @@ async fn main() -> ExitCode {
             exe,
             market,
             game_args,
-        } => commands::run::run(&client, &tokens, source, wine, exe, market, game_args).await,
+        } => commands::run::run(client, tokens, source, wine, exe, market, game_args).await,
         SubCommand::Clep { action } => match action {
             ClepAction::Generate {
                 smbios,
@@ -323,11 +325,7 @@ async fn main() -> ExitCode {
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
         SubCommand::SpLicense { block } => commands::splicense::run(block),
-    };
-
-    xodus::secrets::destroy_secrets();
-
-    code
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -512,5 +510,90 @@ mod cli_tests {
         ] {
             assert!(!env_flag_value(value), "{value:?} should not enable it");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod dispatch_tests {
+    use std::process::ExitCode;
+    use std::sync::Arc;
+
+    use clap::Parser;
+    use xodus::tokens::TokenManager;
+    use xodus::tokens::backend::MemoryBackend;
+    use xodus::tokens::store::{TokenBackend, TokenStoreError};
+
+    use super::{CliArgs, dispatch};
+
+    /// Any persistent-token access means a command provisioned or read device
+    /// credentials; these tests only exercise local failures, so that is a bug.
+    struct ForbiddenBackend;
+
+    impl TokenBackend for ForbiddenBackend {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+            panic!("unexpected device credential read for {key}");
+        }
+
+        fn set(&self, key: &str, _value: &[u8]) -> Result<(), TokenStoreError> {
+            panic!("unexpected device credential write for {key}");
+        }
+
+        fn remove(&self, key: &str) -> Result<(), TokenStoreError> {
+            panic!("unexpected device credential removal for {key}");
+        }
+    }
+
+    fn forbidden_tokens() -> TokenManager {
+        TokenManager::new(
+            Arc::new(ForbiddenBackend),
+            Arc::new(MemoryBackend::default()),
+        )
+    }
+
+    fn offline_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_missing_source_does_not_touch_device_credentials() {
+        let work = tempfile::tempdir().unwrap();
+        let missing = work.path().join("missing");
+        let args = CliArgs::try_parse_from(["xodus-cli", "run", missing.to_str().unwrap(), "wine"])
+            .expect("failed to parse run arguments");
+
+        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn streaming_bad_destination_does_not_touch_device_credentials() {
+        let work = tempfile::tempdir().unwrap();
+        let blocker = work.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let destination = blocker.join("output").to_string_lossy().into_owned();
+        // A content id source normally needs a package list (device token)
+        // before the destination is touched; validating the destination first
+        // must make this fail offline.
+        let args = CliArgs::try_parse_from([
+            "xodus-cli",
+            "streaming",
+            "00000000-0000-0000-0000-000000000001",
+            &destination,
+            "--sub-product",
+            "NOT-A-PRODUCT",
+        ])
+        .expect("failed to parse streaming arguments");
+
+        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn clep_does_not_touch_device_credentials() {
+        let args = CliArgs::try_parse_from(["xodus-cli", "clep", "generate"])
+            .expect("failed to parse clep arguments");
+
+        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 }
