@@ -99,8 +99,9 @@ pub(super) async fn prepare_existing(
     if !device_token_is_current(tokens)? {
         // Parallel library/account runs can renew the same device at once.
         // Serialize refresh + write, then re-read: a process that waited for
-        // the lock must reuse the token another process already saved.
-        let _lock = acquire_device_refresh_lock()?;
+        // the lock must reuse the token another process already saved. If the
+        // lock itself is unavailable, refresh without it rather than fail.
+        let _lock = acquire_device_refresh_lock().await;
         if device_token_is_current(tokens)? {
             tracing::debug!("device token was renewed by another process");
         } else {
@@ -148,25 +149,37 @@ fn device_refresh_lock_path() -> PathBuf {
     std::env::temp_dir().join(format!("xodus-device-refresh-{user}.lock"))
 }
 
-fn acquire_device_refresh_lock() -> Result<File, CommandError> {
+async fn acquire_device_refresh_lock() -> Option<File> {
     let path = device_refresh_lock_path();
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // Never follow a symlink planted in the shared temp directory.
+        options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
     }
-    let file = options.open(&path).map_err(|err| {
-        CommandError::other_from(
-            format!("could not open the device refresh lock: {err}"),
-            err,
-        )
-    })?;
-    fs2::FileExt::lock_exclusive(&file).map_err(|err| {
-        CommandError::other_from(format!("could not lock device refresh: {err}"), err)
-    })?;
-    Ok(file)
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::debug!("device refresh lock unavailable, refreshing without it: {err}");
+            return None;
+        }
+    };
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Some(file),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                // Yield to the runtime so the command's outer timeout can
+                // cancel a long wait between another process's refresh.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(err) => {
+                tracing::debug!("device refresh lock unavailable, refreshing without it: {err}");
+                return None;
+            }
+        }
+    }
 }
 
 /// Exchange the stored user credential for a compact ticket in `scope`.

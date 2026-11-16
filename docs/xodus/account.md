@@ -104,4 +104,4 @@ PC Game Pass: active
 
 `account --json` returns success for a signed-out account so a launcher can
 render the signed-out state without treating it as an error. An invalid
-`--market` is a usage error and exits 1.
+`--market` is a usage error and exits 1, even when signed out.
