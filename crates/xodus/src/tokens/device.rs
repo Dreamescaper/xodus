@@ -89,6 +89,24 @@ pub async fn ensure_device_credentials(
     }
 }
 
+/// Renew only an already registered device.
+///
+/// Optional read-only commands use this instead of [`ensure_device_credentials`]
+/// so a missing device identity is reported without silently provisioning one.
+pub async fn refresh_existing_device_credentials(
+    client: &reqwest::Client,
+    tokens: &TokenManager,
+) -> Result<(), DeviceError> {
+    let license = tokens.get_device_license().map_err(|err| match err {
+        TokenStoreError::NotFound => DeviceError::auth(
+            "no device credentials are stored; sign in before reading the account",
+            err,
+        ),
+        err => DeviceError::other(format!("could not read the device license: {err}"), err),
+    })?;
+    reauthenticate_device(client, tokens, license).await
+}
+
 async fn provision_device(
     client: &reqwest::Client,
     tokens: &TokenManager,
@@ -199,7 +217,10 @@ mod tests {
     use crate::tokens::backend::MemoryBackend;
     use crate::tokens::store::{TokenBackend, TokenStoreError};
 
-    use super::{DeviceErrorKind, TokenManager, ensure_device_credentials};
+    use super::{
+        DeviceErrorKind, TokenManager, ensure_device_credentials,
+        refresh_existing_device_credentials,
+    };
 
     struct ErroringBackend {
         device_license: Option<Device>,
@@ -294,6 +315,19 @@ mod tests {
                 .to_string()
                 .contains("could not read the device license")
         );
+        assert_no_connection(&listener);
+    }
+
+    #[tokio::test]
+    async fn refresh_existing_device_never_provisions_a_missing_identity() {
+        let (client, listener) = guarded_client();
+        let tokens = TokenManager::with_memory();
+        let error = refresh_existing_device_credentials(&client, &tokens)
+            .await
+            .expect_err("a missing device identity must be reported");
+
+        assert_eq!(error.kind(), DeviceErrorKind::Auth);
+        assert!(tokens.get_device_license().is_err());
         assert_no_connection(&listener);
     }
 }

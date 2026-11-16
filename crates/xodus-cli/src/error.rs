@@ -1,7 +1,11 @@
 use std::error::Error;
 use std::fmt;
+use std::process::ExitCode;
 
 use xodus::tokens::device::{DeviceError, DeviceErrorKind};
+
+/// Exit code used for `CommandError::Auth`.
+pub const AUTH_EXIT_CODE: u8 = 2;
 
 #[derive(Debug)]
 pub enum CommandError {
@@ -37,6 +41,13 @@ impl CommandError {
         }
     }
 
+    pub fn network(message: impl Into<String>) -> Self {
+        Self::Network {
+            message: message.into(),
+            source: None,
+        }
+    }
+
     pub fn network_from(
         message: impl Into<String>,
         source: impl Error + Send + Sync + 'static,
@@ -62,6 +73,23 @@ impl CommandError {
             message: message.into(),
             source: Some(Box::new(source)),
         }
+    }
+
+    /// Stable process exit status for launcher-facing commands.
+    ///
+    /// Authentication/not-signed-in is distinct so a launcher can offer sign-in
+    /// instead of retrying; everything else is a general failure.
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Auth { .. } => ExitCode::from(AUTH_EXIT_CODE),
+            Self::Network { .. } | Self::Other { .. } => ExitCode::FAILURE,
+        }
+    }
+
+    /// Report the stable `error:` line on stderr. Never includes tokens,
+    /// account identifiers or response bodies by construction.
+    pub fn report(&self) {
+        eprintln!("error: {self}");
     }
 }
 

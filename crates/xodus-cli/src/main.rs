@@ -78,6 +78,18 @@ enum SubCommand {
         #[arg(long, default_value_t = false, help = "Remove device license")]
         device: bool,
     },
+    #[command(about = "Read the stored account's Store entitlements")]
+    Library {
+        #[arg(long, default_value_t = false, help = "Emit schema-versioned JSON")]
+        json: bool,
+        #[arg(
+            long,
+            default_value = "US",
+            value_name = "MARKET",
+            help = "Two-letter Store market, for example US"
+        )]
+        market: String,
+    },
     #[command(about = "Download and extract the game through streaming algorithm")]
     Streaming {
         source: String,
@@ -211,6 +223,14 @@ async fn main() -> ExitCode {
         .connection_verbose(true)
         .build()
         .unwrap();
+    // Read-only account commands must not forward the Authorization header to a
+    // redirect target and should fail a stalled Microsoft request quickly.
+    let read_client = reqwest::ClientBuilder::new()
+        .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
     let args = CliArgs::parse();
     let non_interactive = args.non_interactive || env_flag("XODUS_NON_INTERACTIVE");
 
@@ -219,7 +239,14 @@ async fn main() -> ExitCode {
     // Purely local commands (clep, sp-license, logout, help/version) therefore
     // never contact Microsoft or the keychain.
     let tokens = TokenManager::with_keychain_and_memory();
-    let code = dispatch(args.command, non_interactive, &client, &tokens).await;
+    let code = dispatch(
+        args.command,
+        non_interactive,
+        &client,
+        &read_client,
+        &tokens,
+    )
+    .await;
 
     xodus::secrets::destroy_secrets();
 
@@ -230,6 +257,7 @@ async fn dispatch(
     command: SubCommand,
     non_interactive: bool,
     client: &reqwest::Client,
+    read_client: &reqwest::Client,
     tokens: &TokenManager,
 ) -> ExitCode {
     match command {
@@ -269,6 +297,9 @@ async fn dispatch(
         }
         SubCommand::Login => commands::login::run(client, tokens).await,
         SubCommand::Logout { device } => commands::logout::run(tokens, device).await,
+        SubCommand::Library { json, market } => {
+            commands::library::run(read_client, tokens, json, market).await
+        }
         SubCommand::Extract {
             path,
             destination,
@@ -496,6 +527,32 @@ mod cli_tests {
     }
 
     #[test]
+    fn library_parses_json_and_market() {
+        let args = CliArgs::try_parse_from(["xodus-cli", "library", "--json", "--market", "gb"])
+            .expect("failed to parse library arguments");
+        match args.command {
+            SubCommand::Library { json, market } => {
+                assert!(json);
+                assert_eq!(market, "gb");
+            }
+            _ => panic!("expected the library subcommand"),
+        }
+    }
+
+    #[test]
+    fn library_defaults_to_human_output_and_us_market() {
+        let args =
+            CliArgs::try_parse_from(["xodus-cli", "library"]).expect("failed to parse library");
+        match args.command {
+            SubCommand::Library { json, market } => {
+                assert!(!json);
+                assert_eq!(market, "US");
+            }
+            _ => panic!("expected the library subcommand"),
+        }
+    }
+
+    #[test]
     fn non_interactive_env_value_accepts_only_truthy_values() {
         for value in [Some("1"), Some("true"), Some("YES"), Some("on")] {
             assert!(env_flag_value(value), "{value:?} should enable it");
@@ -589,7 +646,14 @@ mod dispatch_tests {
         let args = CliArgs::try_parse_from(["xodus-cli", "run", missing.to_str().unwrap(), "wine"])
             .expect("failed to parse run arguments");
 
-        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        let code = dispatch(
+            args.command,
+            false,
+            &offline_client(),
+            &offline_client(),
+            &forbidden_tokens(),
+        )
+        .await;
         assert_eq!(code, ExitCode::FAILURE);
     }
 
@@ -612,7 +676,14 @@ mod dispatch_tests {
         ])
         .expect("failed to parse streaming arguments");
 
-        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        let code = dispatch(
+            args.command,
+            false,
+            &offline_client(),
+            &offline_client(),
+            &forbidden_tokens(),
+        )
+        .await;
         assert_eq!(code, ExitCode::FAILURE);
     }
 
@@ -640,7 +711,7 @@ mod dispatch_tests {
             .build()
             .unwrap();
 
-        let code = dispatch(args.command, false, &client, &tokens).await;
+        let code = dispatch(args.command, false, &client, &client, &tokens).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert!(
             reads.load(std::sync::atomic::Ordering::SeqCst) > 0,
@@ -674,7 +745,14 @@ mod dispatch_tests {
         ])
         .expect("failed to parse streaming arguments");
 
-        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        let code = dispatch(
+            args.command,
+            false,
+            &offline_client(),
+            &offline_client(),
+            &forbidden_tokens(),
+        )
+        .await;
         assert_eq!(code, ExitCode::FAILURE);
 
         match listener.accept() {
@@ -689,7 +767,14 @@ mod dispatch_tests {
         let args = CliArgs::try_parse_from(["xodus-cli", "clep", "generate"])
             .expect("failed to parse clep arguments");
 
-        let code = dispatch(args.command, false, &offline_client(), &forbidden_tokens()).await;
+        let code = dispatch(
+            args.command,
+            false,
+            &offline_client(),
+            &offline_client(),
+            &forbidden_tokens(),
+        )
+        .await;
         assert_eq!(code, ExitCode::SUCCESS);
     }
 }

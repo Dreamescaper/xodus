@@ -71,6 +71,31 @@ impl From<soap::RequestSecurityTokenResponse> for Token {
     }
 }
 
+/// Store and licensing services reject delegation-compact tickets in the "d="
+/// form that Xbox Live sign-in needs and accept the same value as "t=".
+///
+/// Ported from domsvoboda/nexus-backend with credit. Convert only where a ticket
+/// is sent to those services; the value itself is never decoded or logged.
+pub fn store_ticket(ticket: String) -> String {
+    match ticket.strip_prefix("d=") {
+        Some(value) => format!("t={value}"),
+        None => ticket,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_ticket;
+
+    #[test]
+    fn store_ticket_converts_only_delegation_tickets() {
+        assert_eq!(store_ticket("d=abc".into()), "t=abc");
+        assert_eq!(store_ticket("t=abc&p=".into()), "t=abc&p=");
+        assert_eq!(store_ticket("abc".into()), "abc");
+        assert_eq!(store_ticket(String::new()), "");
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenStore {
     #[serde(flatten)]
