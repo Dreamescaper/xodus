@@ -90,6 +90,11 @@ enum SubCommand {
         )]
         market: String,
     },
+    #[command(about = "Show the stored account and best-effort PC Game Pass status")]
+    Account {
+        #[arg(long, default_value_t = false, help = "Emit schema-versioned JSON")]
+        json: bool,
+    },
     #[command(about = "Download and extract the game through streaming algorithm")]
     Streaming {
         source: String,
@@ -300,6 +305,7 @@ async fn dispatch(
         SubCommand::Library { json, market } => {
             commands::library::run(read_client, tokens, json, market).await
         }
+        SubCommand::Account { json } => commands::account::run(read_client, tokens, json).await,
         SubCommand::Extract {
             path,
             destination,
@@ -527,6 +533,23 @@ mod cli_tests {
     }
 
     #[test]
+    fn account_parses_json_flag() {
+        let args = CliArgs::try_parse_from(["xodus-cli", "account", "--json"])
+            .expect("failed to parse account arguments");
+        match args.command {
+            SubCommand::Account { json } => assert!(json),
+            _ => panic!("expected the account subcommand"),
+        }
+
+        let default =
+            CliArgs::try_parse_from(["xodus-cli", "account"]).expect("failed to parse account");
+        match default.command {
+            SubCommand::Account { json } => assert!(!json),
+            _ => panic!("expected the account subcommand"),
+        }
+    }
+
+    #[test]
     fn library_parses_json_and_market() {
         let args = CliArgs::try_parse_from(["xodus-cli", "library", "--json", "--market", "gb"])
             .expect("failed to parse library arguments");
@@ -635,8 +658,59 @@ mod dispatch_tests {
         )
     }
 
+    /// An empty account store: the user record and user tokens are absent, but
+    /// any device or other persistent access is a bug for an offline account
+    /// status command.
+    struct EmptyUserBackend;
+
+    impl TokenBackend for EmptyUserBackend {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+            match key {
+                "user-DA" | "user-tokens" => Ok(None),
+                _ => panic!("unexpected device credential read for {key}"),
+            }
+        }
+
+        fn set(&self, key: &str, _value: &[u8]) -> Result<(), TokenStoreError> {
+            panic!("unexpected credential write for {key}");
+        }
+
+        fn remove(&self, key: &str) -> Result<(), TokenStoreError> {
+            panic!("unexpected credential removal for {key}");
+        }
+    }
+
+    fn empty_user_tokens() -> TokenManager {
+        TokenManager::new(
+            Arc::new(EmptyUserBackend),
+            Arc::new(MemoryBackend::default()),
+        )
+    }
+
     fn offline_client() -> reqwest::Client {
         reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    /// Any network access in an offline test goes through this loopback proxy.
+    /// The listener stays non-blocking so the test can prove it was never used.
+    fn guarded_client() -> (reqwest::Client, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(250))
+            .proxy(reqwest::Proxy::all(proxy).unwrap())
+            .build()
+            .unwrap();
+        (client, listener)
+    }
+
+    fn assert_no_connection(listener: &std::net::TcpListener) {
+        match listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("an offline command unexpectedly contacted the network"),
+            Err(err) => panic!("proxy listener failed: {err}"),
+        }
     }
 
     #[tokio::test]
@@ -776,5 +850,18 @@ mod dispatch_tests {
         )
         .await;
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn account_json_with_empty_store_reports_signed_out_without_device_or_network() {
+        let args = CliArgs::try_parse_from(["xodus-cli", "account", "--json"])
+            .expect("failed to parse account arguments");
+        let (client, listener) = guarded_client();
+
+        let code = dispatch(args.command, false, &client, &client, &empty_user_tokens()).await;
+
+        // The command prints `signedIn:false` from stored state and exits 0.
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_no_connection(&listener);
     }
 }
