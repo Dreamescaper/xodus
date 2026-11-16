@@ -26,7 +26,18 @@ struct OfflineState {
     can_check_network: bool,
 }
 
-pub async fn run(client: &reqwest::Client, tokens: &TokenManager, json_output: bool) -> ExitCode {
+pub async fn run(
+    client: &reqwest::Client,
+    tokens: &TokenManager,
+    json_output: bool,
+    market: String,
+) -> ExitCode {
+    let market = market.to_ascii_uppercase();
+    if market.len() != 2 || !market.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        let error = CommandError::other("invalid market; use a two-letter Store market such as US");
+        error.report();
+        return error.exit_code();
+    }
     let state = match offline_state(tokens) {
         Ok(state) => state,
         Err(error) => {
@@ -35,7 +46,7 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager, json_output: b
         }
     };
     let value = if state.can_check_network {
-        match tokio::time::timeout(ENRICH_TIMEOUT, enrich(client, tokens)).await {
+        match tokio::time::timeout(ENRICH_TIMEOUT, enrich(client, tokens, &market)).await {
             Ok(enrichment) => merged(state.value, enrichment),
             Err(_) => merged(state.value, Enrichment::unavailable()),
         }
@@ -52,8 +63,8 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager, json_output: b
 }
 
 fn offline_state(tokens: &TokenManager) -> Result<OfflineState, CommandError> {
-    let user = match tokens.get_user() {
-        Ok(user) => user,
+    match tokens.get_user() {
+        Ok(_) => {}
         Err(TokenStoreError::NotFound) => {
             return Ok(OfflineState {
                 value: json!({
@@ -73,8 +84,7 @@ fn offline_state(tokens: &TokenManager) -> Result<OfflineState, CommandError> {
                 err,
             ));
         }
-    };
-    let _ = user;
+    }
 
     let session_state = match tokens.get_user_sts_token() {
         Ok(token) => state_name(&token),
@@ -138,7 +148,7 @@ impl Enrichment {
     }
 }
 
-async fn enrich(client: &reqwest::Client, tokens: &TokenManager) -> Enrichment {
+async fn enrich(client: &reqwest::Client, tokens: &TokenManager, market: &str) -> Enrichment {
     let session = match prepare_existing(client, tokens).await {
         Ok(session) => session,
         Err(error) => {
@@ -147,8 +157,10 @@ async fn enrich(client: &reqwest::Client, tokens: &TokenManager) -> Enrichment {
         }
     };
 
-    let (profile, game_pass) =
-        tokio::join!(profile::gamertag(&session), subscription::lookup(&session));
+    let (profile, game_pass) = tokio::join!(
+        profile::gamertag(&session),
+        subscription::lookup(&session, market)
+    );
     // Never publish details requested for one account after the store switched.
     if tokens
         .get_user()
@@ -158,20 +170,24 @@ async fn enrich(client: &reqwest::Client, tokens: &TokenManager) -> Enrichment {
         return Enrichment::unavailable();
     }
 
-    let mut checked = true;
+    let mut succeeded = 0;
     let gamertag = match profile {
-        Ok(name) => Some(name),
+        Ok(name) => {
+            succeeded += 1;
+            Some(name)
+        }
         Err(error) => {
             tracing::debug!("gamertag was not refreshed: {error}");
-            checked = false;
             None
         }
     };
     let game_pass = match game_pass {
-        Ok(status) => status.as_str(),
+        Ok(status) => {
+            succeeded += 1;
+            status.as_str()
+        }
         Err(error) => {
             tracing::debug!("PC Game Pass was not refreshed: {error}");
-            checked = false;
             "unknown"
         }
     };
@@ -179,7 +195,11 @@ async fn enrich(client: &reqwest::Client, tokens: &TokenManager) -> Enrichment {
     Enrichment {
         gamertag,
         game_pass,
-        network: if checked { "checked" } else { "unavailable" },
+        network: match succeeded {
+            2 => "checked",
+            1 => "partial",
+            _ => "unavailable",
+        },
     }
 }
 
@@ -193,18 +213,27 @@ fn merged(mut value: Value, enrichment: Enrichment) -> Value {
 }
 
 fn print_human(value: &Value) {
+    print!("{}", human_output(value));
+}
+
+fn human_output(value: &Value) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
     if value["signedIn"] != true {
-        println!("Not signed in");
-        return;
+        output.push_str("Not signed in\n");
+        return output;
     }
-    println!("Signed in");
+    output.push_str("Signed in\n");
     if let Some(gamertag) = value["gamertag"].as_str() {
-        println!("Gamertag: {gamertag}");
+        let _ = writeln!(output, "Gamertag: {gamertag}");
     }
-    println!(
+    let _ = writeln!(
+        output,
         "PC Game Pass: {}",
         value["gamePass"].as_str().unwrap_or("unknown")
     );
+    output
 }
 
 #[cfg(test)]
@@ -226,16 +255,46 @@ mod tests {
     }
 
     #[test]
-    fn human_output_never_prints_an_email() {
+    fn human_output_prints_only_known_status_fields() {
         let value = json!({
             "schema": 1,
             "signedIn": true,
             "session": "current",
             "gamertag": "Example",
             "gamePass": "active",
-            "network": "checked"
+            "network": "checked",
+            "username": "private@example.test",
+            "puid": "private-puid"
         });
-        assert!(!value.to_string().contains("example.test"));
+        let output = human_output(&value);
+        assert!(output.contains("Signed in"));
+        assert!(output.contains("Gamertag: Example"));
+        assert!(output.contains("PC Game Pass: active"));
+        assert!(!output.contains("private@example.test"));
+        assert!(!output.contains("private-puid"));
+    }
+
+    #[test]
+    fn merged_reports_partial_when_only_one_enrichment_succeeded() {
+        let base = json!({
+            "schema": 1,
+            "signedIn": true,
+            "session": "current",
+            "gamertag": null,
+            "gamePass": "unknown",
+            "network": "skipped"
+        });
+        let value = merged(
+            base,
+            Enrichment {
+                gamertag: Some("Example".into()),
+                game_pass: "unknown",
+                network: "partial",
+            },
+        );
         assert_eq!(value["gamertag"], "Example");
+        assert_eq!(value["gamePass"], "unknown");
+        assert_eq!(value["network"], "partial");
+        assert!(value.get("username").is_none());
     }
 }

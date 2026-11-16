@@ -94,6 +94,13 @@ enum SubCommand {
     Account {
         #[arg(long, default_value_t = false, help = "Emit schema-versioned JSON")]
         json: bool,
+        #[arg(
+            long,
+            default_value = "US",
+            value_name = "MARKET",
+            help = "Two-letter Store market, for example US"
+        )]
+        market: String,
     },
     #[command(about = "Download and extract the game through streaming algorithm")]
     Streaming {
@@ -305,7 +312,9 @@ async fn dispatch(
         SubCommand::Library { json, market } => {
             commands::library::run(read_client, tokens, json, market).await
         }
-        SubCommand::Account { json } => commands::account::run(read_client, tokens, json).await,
+        SubCommand::Account { json, market } => {
+            commands::account::run(read_client, tokens, json, market).await
+        }
         SubCommand::Extract {
             path,
             destination,
@@ -533,18 +542,24 @@ mod cli_tests {
     }
 
     #[test]
-    fn account_parses_json_flag() {
-        let args = CliArgs::try_parse_from(["xodus-cli", "account", "--json"])
+    fn account_parses_json_flag_and_market() {
+        let args = CliArgs::try_parse_from(["xodus-cli", "account", "--json", "--market", "gb"])
             .expect("failed to parse account arguments");
         match args.command {
-            SubCommand::Account { json } => assert!(json),
+            SubCommand::Account { json, market } => {
+                assert!(json);
+                assert_eq!(market, "gb");
+            }
             _ => panic!("expected the account subcommand"),
         }
 
         let default =
             CliArgs::try_parse_from(["xodus-cli", "account"]).expect("failed to parse account");
         match default.command {
-            SubCommand::Account { json } => assert!(!json),
+            SubCommand::Account { json, market } => {
+                assert!(!json);
+                assert_eq!(market, "US");
+            }
             _ => panic!("expected the account subcommand"),
         }
     }

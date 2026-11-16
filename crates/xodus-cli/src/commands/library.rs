@@ -11,17 +11,17 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use super::api::{APP_VERSION, CALLING_APP_NAME};
+use super::session::{prepare_existing, store_ticket};
+use super::subscription;
+use crate::error::CommandError;
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use xodus::tokens::TokenManager;
 use xodus::tokens::store::TokenStoreError;
 
-use super::session::{prepare_existing, store_ticket};
-use super::subscription;
-use crate::error::CommandError;
-
-const ENTITLEMENTS_URL: &str = "https://beige.xboxservices.com/PCGAFD/entitlements?market={market}&language=en-US&appVersion=0.2.3";
+const ENTITLEMENTS_URL: &str = "https://beige.xboxservices.com/PCGAFD/entitlements?market={market}&language=en-US&appVersion={appVersion}";
 const MAX_PAGE_BYTES: usize = 4_194_304;
 const MAX_TOTAL_BYTES: usize = 16_777_216;
 const MAX_PAGES: usize = 20;
@@ -238,8 +238,13 @@ fn access(product_id: &str, entries: &BTreeMap<String, Row>, now: DateTime<Utc>)
             return "restricted";
         }
         match &row.parent {
-            Some(parent) if subscription::is_plan(parent) => "gamepass",
             Some(parent) => {
+                // A known plan ID without its own row is still enough to infer
+                // subscription access. When the plan row is present, however,
+                // its state must be walked like any other parent.
+                if subscription::is_plan(parent) && !entries.contains_key(parent) {
+                    return "gamepass";
+                }
                 visited.push(product_id);
                 let parent_access = walk(parent, entries, now, visited);
                 visited.pop();
@@ -249,6 +254,11 @@ fn access(product_id: &str, entries: &BTreeMap<String, Row>, now: DateTime<Utc>)
                     "trial" => "trial",
                     "expired" => "expired",
                     "shared" => "shared",
+                    "inactive" => "inactive",
+                    "restricted" => "restricted",
+                    // An active PC Game Pass plan row is not a game tile, but
+                    // its child is Game Pass access.
+                    "subscription" => "gamepass",
                     _ => "unverified",
                 }
             }
@@ -289,12 +299,14 @@ async fn query(
             "{}.0",
             STANDARD_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes())
         );
-        let url = ENTITLEMENTS_URL.replace("{market}", market);
+        let url = ENTITLEMENTS_URL
+            .replace("{market}", market)
+            .replace("{appVersion}", APP_VERSION);
         let mut request = client
             .get(url)
             .header("Authorization", &ticket)
             .header("X-MS-API-Version", "1.1")
-            .header("Calling-App-Name", "Xodus-Nexus")
+            .header("Calling-App-Name", CALLING_APP_NAME)
             .header("MS-CV", correlation);
         if let Some(ref cursor) = continuation {
             request = request.header("x-ms-ct", cursor);
@@ -765,6 +777,43 @@ mod tests {
             item_for("9FFFFFFFFFFF", &result.entries)["access"],
             "unverified"
         );
+    }
+
+    #[test]
+    fn present_expired_or_inactive_plan_parent_limits_the_child() {
+        let mut expired_plan = valid();
+        expired_plan["endDate"] = json!("2000-01-01T00:00:00Z");
+        let mut expired_child = valid();
+        expired_child["satisfiedByProductId"] = json!(PLAN);
+        let mut result = Entitlements::default();
+        result
+            .add(&page(vec![(PLAN, expired_plan), (A, expired_child)]))
+            .unwrap();
+        result.finish();
+        assert_eq!(item_for(PLAN, &result.entries)["access"], "expired");
+        assert_eq!(item_for(A, &result.entries)["access"], "expired");
+
+        let mut inactive_plan = valid();
+        inactive_plan["status"] = json!("Revoked");
+        let mut inactive_child = valid();
+        inactive_child["satisfiedByProductId"] = json!(PLAN);
+        let mut result = Entitlements::default();
+        result
+            .add(&page(vec![(PLAN, inactive_plan), (A, inactive_child)]))
+            .unwrap();
+        result.finish();
+        assert_eq!(item_for(PLAN, &result.entries)["access"], "inactive");
+        assert_eq!(item_for(A, &result.entries)["access"], "inactive");
+    }
+
+    #[test]
+    fn missing_plan_parent_is_inferred_as_gamepass() {
+        let mut child = valid();
+        child["satisfiedByProductId"] = json!(PLAN);
+        let mut result = Entitlements::default();
+        result.add(&page(vec![(A, child)])).unwrap();
+        result.finish();
+        assert_eq!(item_for(A, &result.entries)["access"], "gamepass");
     }
 
     #[test]

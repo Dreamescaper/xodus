@@ -26,10 +26,13 @@ The ticket is never written to stdout or stderr. The command sends:
 GET https://beige.xboxservices.com/PCGAFD/entitlements?market=US&language=en-US&appVersion=0.2.3
 Authorization: <store ticket>
 X-MS-API-Version: 1.1
-Calling-App-Name: Xodus-Nexus
+Calling-App-Name: xodus-cli
 MS-CV: <random correlation id>
 x-ms-ct: <continuation cursor, when present>
 ```
+
+`Calling-App-Name` and `appVersion` are identification only. Their values live
+in `crates/xodus-cli/src/commands/api.rs`, shared with the membership request.
 
 Pagination follows the `x-ms-ct` response header. Up to 20 pages, 4 MiB per
 page and 16 MiB in total are accepted.
@@ -42,8 +45,8 @@ page and 16 MiB in total are accepted.
 {
   "schema": 1,
   "items": [
-    {"productId": "9NBLGGH4R315", "access": "owned", "kind": "game"},
-    {"productId": "9P1J8S7CCWWT", "access": "gamepass", "kind": "addon"},
+    {"productId": "9NBLGGH4R315", "access": "owned", "kind": null},
+    {"productId": "9P1J8S7CCWWT", "access": "gamepass", "kind": null},
     {"productId": "9WZDNCRFJ3Q8", "access": "trial", "kind": null},
     {"productId": "9NBLGGH5R558", "access": "expired", "kind": null}
   ],
@@ -60,10 +63,12 @@ page and 16 MiB in total are accepted.
 | `items[].kind` | `game`, `addon`, `app`, `subscription`, `unknown`, or `null` when the entitlement data does not say. |
 | `skipped` | Number of malformed, conflicting or dependent rows that were quarantined. |
 
-`kind` is only reported when the entitlement row explicitly supplies a product
-type; a license by itself does not prove whether a product is a game, add-on or
-app. `subscription` is used for the known PC Game Pass plan product IDs.
-Highball reads the public display catalog for titles and art.
+The entitlements endpoint rarely carries a product type, so `kind` is usually
+`null`. Consumers must treat `null` as "look this product up in the public
+display catalog"; a license by itself does not prove whether a product is a
+game, add-on or app. `kind` is only filled in when the row explicitly supplies a
+type, or with `subscription` for the known PC Game Pass plan product IDs.
+Highball reads the display catalog for titles and art.
 
 ### Access values
 
@@ -72,7 +77,7 @@ Access is derived defensively; a parent chain must itself be licensed.
 | Value | Meaning |
 | --- | --- |
 | `owned` | Active, paid/direct license, or a child of an owned bundle. |
-| `gamepass` | Active license satisfied by a known PC Game Pass plan. |
+| `gamepass` | Active license satisfied by a known PC Game Pass plan. Detection is inferred from `satisfiedByProductId` (or an active present plan row) and has not yet been verified against a captured live response. |
 | `trial` | Active, but marked by the service as a trial. |
 | `expired` | Expiry date has passed, or the service reports it as expired. |
 | `shared` | Access comes from another account (`sharingSource` is not `None`). |
@@ -108,8 +113,8 @@ Without `--json`, a short table is printed:
 
 ```
 PRODUCT       ACCESS        KIND
-9NBLGGH4R315  owned         game
-9P1J8S7CCWWT  gamepass      addon
+9NBLGGH4R315  owned         unknown
+9P1J8S7CCWWT  gamepass      unknown
 ```
 
 ## Exit codes

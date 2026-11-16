@@ -5,6 +5,9 @@
 //! only an already registered device: optional reads never provision a device,
 //! open a login UI, or delete stored credentials.
 
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
+
 use xodus::models::live::ExchangeUserTokenOutcome;
 use xodus::models::secrets::{LegacyToken, Token, store_ticket as to_store_ticket};
 use xodus::models::soap;
@@ -93,22 +96,20 @@ pub(super) async fn prepare_existing(
         }
     }
 
-    let device_current = match tokens.get_device_sts_token() {
-        Ok(token) => session::state(&token, chrono::Utc::now()) == State::Current,
-        Err(TokenStoreError::NotFound | TokenStoreError::Serde(_)) => false,
-        Err(err) => {
-            return Err(CommandError::other_from(
-                format!("could not read the device token: {err}"),
-                err,
-            ));
+    if !device_token_is_current(tokens)? {
+        // Parallel library/account runs can renew the same device at once.
+        // Serialize refresh + write, then re-read: a process that waited for
+        // the lock must reuse the token another process already saved.
+        let _lock = acquire_device_refresh_lock()?;
+        if device_token_is_current(tokens)? {
+            tracing::debug!("device token was renewed by another process");
+        } else {
+            // This renews the existing device only. A missing device license
+            // was handled above, so this path cannot register a new one.
+            device::refresh_existing_device_credentials(client, tokens)
+                .await
+                .map_err(CommandError::from)?;
         }
-    };
-    if !device_current {
-        // This renews the existing device only. A missing device license was
-        // handled above, so this path cannot register a new one.
-        device::refresh_existing_device_credentials(client, tokens)
-            .await
-            .map_err(CommandError::from)?;
     }
 
     let device_token = tokens.get_device_sts_token().map_err(|err| {
@@ -126,6 +127,46 @@ pub(super) async fn prepare_existing(
         user: user_token,
         device: device_token,
     })
+}
+
+fn device_token_is_current(tokens: &TokenManager) -> Result<bool, CommandError> {
+    match tokens.get_device_sts_token() {
+        Ok(token) => Ok(session::state(&token, chrono::Utc::now()) == State::Current),
+        Err(TokenStoreError::NotFound | TokenStoreError::Serde(_)) => Ok(false),
+        Err(err) => Err(CommandError::other_from(
+            format!("could not read the device token: {err}"),
+            err,
+        )),
+    }
+}
+
+fn device_refresh_lock_path() -> PathBuf {
+    #[cfg(unix)]
+    let user = rustix::process::geteuid().to_string();
+    #[cfg(not(unix))]
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_owned());
+    std::env::temp_dir().join(format!("xodus-device-refresh-{user}.lock"))
+}
+
+fn acquire_device_refresh_lock() -> Result<File, CommandError> {
+    let path = device_refresh_lock_path();
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|err| {
+        CommandError::other_from(
+            format!("could not open the device refresh lock: {err}"),
+            err,
+        )
+    })?;
+    fs2::FileExt::lock_exclusive(&file).map_err(|err| {
+        CommandError::other_from(format!("could not lock device refresh: {err}"), err)
+    })?;
+    Ok(file)
 }
 
 /// Exchange the stored user credential for a compact ticket in `scope`.
@@ -203,4 +244,51 @@ fn compact_ticket(outcome: ExchangeUserTokenOutcome) -> Result<String, CommandEr
             }
         })
         .ok_or_else(|| CommandError::other("Microsoft returned no usable compact ticket"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xodus::models::secrets::{LegacyToken, Token};
+    use xodus::models::soap::Timestamp;
+    use xodus::tokens::PASSPORT_STS;
+
+    fn token(expires: &str) -> Token {
+        Token::Legacy(LegacyToken {
+            key_name: None,
+            token: "fixture".into(),
+            binary_secret: None,
+            tpm_key: None,
+            lifetime: Timestamp {
+                id: None,
+                created: "2000-01-01T00:00:00Z".into(),
+                expires: expires.into(),
+            },
+        })
+    }
+
+    #[test]
+    fn recheck_skips_refresh_after_another_process_renews_the_token() {
+        let tokens = TokenManager::with_memory();
+        tokens
+            .save_device_token(PASSPORT_STS.into(), token("2001-01-01T00:00:00Z"))
+            .unwrap();
+        assert!(!device_token_is_current(&tokens).unwrap());
+
+        // Another process renews the token while this process waits for the
+        // refresh lock. The post-lock re-check must skip a second refresh.
+        tokens
+            .save_device_token(PASSPORT_STS.into(), token("2099-01-01T00:00:00Z"))
+            .unwrap();
+        assert!(device_token_is_current(&tokens).unwrap());
+    }
+
+    #[test]
+    fn refresh_lock_lives_in_the_temp_directory_per_user() {
+        let path = device_refresh_lock_path();
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("xodus-device-refresh-"));
+        assert!(name.ends_with(".lock"));
+    }
 }

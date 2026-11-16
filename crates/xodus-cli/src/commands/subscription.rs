@@ -8,6 +8,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use serde_json::{Value, json};
 
+use super::api::{APP_VERSION, CALLING_APP_NAME};
 use super::session::{self, ExistingSession};
 use crate::error::CommandError;
 
@@ -22,7 +23,7 @@ pub(super) const PLANS: &[&str] = &[
     "CFQ7TTC10QFD",
 ];
 
-const SUBSCRIPTION_URL: &str = "https://beige.xboxservices.com/PCGAFD/entitlements/subscriptions?market=US&language=en-US&appVersion=0.2.3";
+const SUBSCRIPTION_URL: &str = "https://beige.xboxservices.com/PCGAFD/entitlements/subscriptions?market={market}&language=en-US&appVersion={appVersion}";
 const MAX_RESPONSE_BYTES: usize = 262_144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,18 +49,29 @@ pub(super) fn is_plan(product_id: &str) -> bool {
 
 /// Ask the Store membership endpoint whether any known PC Game Pass plan is
 /// active for the stored account.
-pub(super) async fn lookup(session: &ExistingSession) -> Result<GamePassStatus, CommandError> {
+pub(super) async fn lookup(
+    session: &ExistingSession,
+    market: &str,
+) -> Result<GamePassStatus, CommandError> {
+    if market.len() != 2 || !market.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return Err(CommandError::other(
+            "invalid market; use a two-letter Store market such as US",
+        ));
+    }
     let ticket = session::store_ticket(session).await?;
     let correlation = format!(
         "{}.0",
         STANDARD_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes())
     );
+    let url = SUBSCRIPTION_URL
+        .replace("{market}", market)
+        .replace("{appVersion}", APP_VERSION);
     let response = session
         .client
-        .post(SUBSCRIPTION_URL)
+        .post(url)
         .header("Authorization", ticket)
         .header("X-MS-API-Version", "1.1")
-        .header("Calling-App-Name", "Xodus-Nexus")
+        .header("Calling-App-Name", CALLING_APP_NAME)
         .header("MS-CV", correlation)
         .json(&json!({"productIds": PLANS}))
         .send()

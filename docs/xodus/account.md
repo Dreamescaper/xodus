@@ -1,8 +1,8 @@
 # Account status
 
-`xodus-cli account --json` reports whether an account is stored and, when it is
-cheap and safe to do so, the Xbox gamertag and PC Game Pass status. It is
-designed for launchers such as Highball.
+`xodus-cli account --json [--market US]` reports whether an account is stored
+and, when it is cheap and safe to do so, the Xbox gamertag and PC Game Pass
+status. It is designed for launchers such as Highball.
 
 The command is offline-first:
 
@@ -46,18 +46,19 @@ Signed out:
 | `session` | `current`, `expired`, `invalid`, or `missing`; checked locally from the stored user token. |
 | `gamertag` | Best-effort Xbox gamertag, or `null` when not available. |
 | `gamePass` | `active`, `inactive`, or `unknown`. |
-| `network` | `checked`, `unavailable`, or `skipped`. |
+| `network` | `checked`, `partial`, `unavailable`, or `skipped`. |
 
 ### `network`
 
 | Value | Meaning |
 | --- | --- |
 | `checked` | Every optional network read that was attempted succeeded. |
-| `unavailable` | A network read was attempted but failed, or timed out. |
+| `partial` | Exactly one of the gamertag and Game Pass reads succeeded. |
+| `unavailable` | All attempted network reads failed, or the read timed out. |
 | `skipped` | No usable existing session/device identity was available, or nobody is signed in. Provisioning or signing in would be required. |
 
-`gamertag` and `gamePass` remain `null` / `unknown` when their checks are
-skipped or unavailable.
+`gamertag` and `gamePass` remain `null` / `unknown` when their individual checks
+are skipped, partial or unavailable.
 
 ## Optional network reads
 
@@ -70,9 +71,10 @@ command may perform up to 20 seconds of best-effort reads:
   `https://profile.xboxlive.com/users/me/profile/settings`.
 - **PC Game Pass**: exchange the stored user credential for a Store ticket
   (`www.microsoft.com`, `MBI_SSL`) and query
-  `https://beige.xboxservices.com/PCGAFD/entitlements/subscriptions?market=US&language=en-US&appVersion=0.2.3`
-  for the known PC Game Pass plan IDs. The implementation is ported from Xodus
-  Nexus's `subscription.rs` with credit.
+  `https://beige.xboxservices.com/PCGAFD/entitlements/subscriptions?market={market}&language=en-US&appVersion=0.2.3`
+  for the known PC Game Pass plan IDs. `--market` defaults to `US` and is
+  uppercased before use. The implementation is ported from Xodus Nexus's
+  `subscription.rs` with credit.
 
 No tokens, account identifiers or raw service responses are emitted. Detailed
 failures are at most logged to stderr through `tracing`; they do not change the
@@ -97,8 +99,9 @@ PC Game Pass: active
 | Code | Meaning |
 | --- | --- |
 | 0 | Status was produced, including when nobody is signed in |
-| 1 | A local credential-store failure prevented reading the stored state |
+| 1 | A non-`NotFound` local credential-store error prevented reading the stored state; `NotFound` means signed out and still exits 0 |
 | 2 | Not used by `account --json` |
 
 `account --json` returns success for a signed-out account so a launcher can
-render the signed-out state without treating it as an error.
+render the signed-out state without treating it as an error. An invalid
+`--market` is a usage error and exits 1.
